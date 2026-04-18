@@ -2,96 +2,86 @@
 
 > 更新时间：`2026-04-18`
 >
-> 这份文档用于把“Proma 发行版 Agent 模式接第三方 Anthropic 格式渠道时，为什么会出现 selected model 报错、真正根因在哪里、以后升级后该怎么复查”长期固定在仓库里，方便每次更新后快速回看。
+> 这份文档用于长期记录一个容易被误判的问题：Proma 在 `Agent` 模式接第三方 `Anthropic` 格式渠道时，报错表面上像“模型不存在 / 无权限”，但真实问题往往出在 **配置来源污染**。
+>
+> **重要补充：这类问题不只发生在发行版，开源版源码链路也有同类风险。**
 
 ## 一句话结论
 
-这次问题**不是 SDK 版本兼容错误**，也**不是模型名本身一定写错**。
+这次问题**不应被简单归因为 SDK 版本兼容错误**，也**不应先归因为模型名写错**。
 
-真正根因是：
+更准确的结论是：
 
-- 发行版运行时文件 `main.cjs` 仍然允许 Claude Agent SDK 同时读取 `user + project` 两级配置；
-- 用户级 `C:\Users\yzjiang\.proma\sdk-config\settings.json` 中残留了旧的 `ANTHROPIC_*` 配置；
-- 这些旧配置污染了当前 Agent 会话真正选择的渠道、Base URL、模型和认证参数；
-- 最终在 UI 上表现为：
+- **历史共性问题**：Agent 运行链路允许 Claude Agent SDK 同时读取 `user + project` 两级设置；
+- **污染源**：用户级 SDK 配置目录中的旧 `ANTHROPIC_*` 设置，可能覆盖当前 Agent 会话真正选择的渠道、Base URL、模型和认证参数；
+- **发行版表现**：如果实际运行的 `main.cjs` 仍是 `settingSources: ["user", "project"]`，这条污染链路就仍然存在；
+- **开源版当前状态**：源码主线已经对 `process.env` 型 `ANTHROPIC_*` 污染做了多层加固，但 `settingSources` 这一层在当前 `main` 源码里仍然是放开的；
+- 因此，**开源版和发行版都和这个问题有关，只是问题落点不完全一样**。
 
-```text
-There's an issue with the selected model (...)
-It may not exist or you may not have access to it.
+## 需要区分的三个关键位置
+
+| 角色 | 绝对路径 | 当前意义 |
+|---|---|---|
+| 开源版源码问题入口 | `D:\Proma-Source\apps\electron\src\main\lib\adapters\claude-agent-adapter.ts` | 当前 `main` 分支里，`settingSources` 仍是 `['user', 'project']` |
+| 发行版实际运行文件 | `C:\Users\yzjiang\AppData\Local\Programs\Proma\resources\app\dist\main.cjs` | 最终用户真正运行的是它；是否还会被 user settings 污染，要以这里的实际内容为准 |
+| 用户级污染源文件 | `C:\Users\yzjiang\.proma\sdk-config\settings.json` | 如果残留旧的 `ANTHROPIC_*`，一旦被 SDK 读到，就可能污染当前 Agent 会话 |
+
+## 为什么说开源版也有类似问题
+
+因为当前开源版 `main` 分支源码里，`settingSources` 仍然允许读 `user + project`。
+
+对应位置：
+
+- `D:\Proma-Source\apps\electron\src\main\lib\adapters\claude-agent-adapter.ts:442`
+
+当前源码实际值：
+
+```ts
+settingSources: ['user', 'project']
 ```
 
-因此，这次问题的本质是：**配置来源被污染**，不是“模型一定不存在”。
+这意味着：
 
-## 两个关键文件
+- 只要 SDK 用户级配置目录中还有旧的 `ANTHROPIC_*`；
+- 当前 Agent 运行链路就仍然有机会把这些旧值读回来；
+- 从而污染当前界面显式选择的 Agent 渠道配置。
 
-| 角色 | 绝对路径 | 作用 | 是否是根因文件 |
-|---|---|---|---|
-| 程序逻辑文件 | `C:\Users\yzjiang\AppData\Local\Programs\Proma\resources\app\dist\main.cjs` | 决定 Agent 运行时从哪里读取 Claude Agent SDK 配置 | **是** |
-| 污染数据文件 | `C:\Users\yzjiang\.proma\sdk-config\settings.json` | 存放旧的 `ANTHROPIC_*` 残留配置，一旦被读取就会污染当前会话 | 否，它是污染源 |
+所以这不是“只有发行版有问题、开源版完全没问题”。
 
-最准确的说法是：
+更准确的说法是：
 
-- `main.cjs` 是**根因逻辑文件**；
-- `settings.json` 是**污染源数据文件**。
+- **开源版源码层面**：当前仍保留 `user + project` 的读取范围；
+- **发行版运行层面**：要看实际 bundle 是否也仍保留这个值；
+- **两者共享同一类历史根因：用户级 SDK 配置可能覆盖当前 Agent 会话配置。**
 
-## 现象
+## 为什么说发行版也有这个问题
 
-在以下条件下更容易复现：
+因为最终用户运行的不是源码，而是打包后的主进程 bundle：
 
-- 使用 Proma **发行版**；
-- 进入 **Agent 模式**；
-- 第三方渠道格式选择 **Anthropic**；
-- 使用类似 `http://127.0.0.1:8317/v1` 这样的第三方接口；
-- 模型填写为类似 `gpt-5.4(xhigh)` 这样的第三方映射模型。
+- `C:\Users\yzjiang\AppData\Local\Programs\Proma\resources\app\dist\main.cjs`
 
-典型报错为：
-
-```text
-There's an issue with the selected model (gpt-5.4(xhigh)).
-It may not exist or you may not have access to it.
-Run --model to pick a different model.
-```
-
-## 容易被误判成什么
-
-这个问题很容易被误判为：
-
-1. 第三方渠道服务挂了；
-2. UI 对 `/v1` 到 `/v1/messages` 的映射坏了；
-3. `gpt-5.4(xhigh)` 这个模型名本身不合法；
-4. Claude Agent SDK 版本升级后出现了接口兼容问题；
-5. Chat 模式能用，因此 Agent 理论上也不该出问题。
-
-这些都不是本次问题的核心结论。
-
-## 为什么判断它不是 SDK 版本兼容问题
-
-当前已有排查结论显示：
-
-- 第三方 Anthropic Messages API 链路本身并没有被证明彻底不可用；
-- 报错与“当前会话实际拿到的最终配置”密切相关；
-- 一旦把设置来源从 `['user', 'project']` 收窄为 `['project']`，同类报错就能恢复；
-- 这说明问题主要出在**配置叠加顺序和来源范围**，而不是 SDK 与第三方服务的协议完全不兼容。
-
-所以更准确的结论是：
-
-**这是 Proma 在 Agent 集成链路中的配置来源设计问题，而不是一个简单的 SDK 版本兼容问题。**
-
-## 真正的根因链条
-
-问题链条如下：
-
-1. 发行版 `main.cjs` 中的 Agent 运行时逻辑仍使用：
+如果这个文件里仍然包含：
 
 ```js
 settingSources: ["user", "project"]
 ```
 
-2. 这意味着 Claude Agent SDK 会同时读取：
-   - 用户级配置；
-   - 项目级配置。
+那么发行版就仍然保留同一条污染链路。
 
-3. 用户级配置文件 `C:\Users\yzjiang\.proma\sdk-config\settings.json` 中如果残留了旧的 `ANTHROPIC_*`，例如：
+也就是说：
+
+- **开源版决定了问题会不会被继续带入构建产物；**
+- **发行版决定了最终用户机器上是否真的还在复现。**
+
+## 真实的根因链条
+
+这类问题的根因链条如下：
+
+1. Agent 集成链路允许 Claude Agent SDK 同时读取：
+   - 用户级设置（`user`）
+   - 项目级设置（`project`）
+
+2. 用户级 SDK 配置目录中如果残留旧的 `ANTHROPIC_*`，例如：
    - `ANTHROPIC_BASE_URL`
    - `ANTHROPIC_API_KEY`
    - `ANTHROPIC_CUSTOM_MODEL_OPTION`
@@ -99,180 +89,263 @@ settingSources: ["user", "project"]
    - `ANTHROPIC_DEFAULT_SONNET_MODEL`
    - `ANTHROPIC_DEFAULT_HAIKU_MODEL`
 
-4. 那么当前界面里实际选中的 Agent 渠道配置，就可能被这些旧值覆盖。
+3. 这些旧值一旦参与配置叠加，就可能覆盖当前会话真正选中的：
+   - Base URL
+   - API Key
+   - 模型
+   - 其他 Anthropic 相关运行参数
 
-5. 最终 SDK 收到的是一组被污染后的 `base URL / model / auth` 组合，于是落入“selected model 不存在或无权限”的错误分支。
+4. 最终 SDK 实际拿到的是一组被污染后的 `base URL / model / auth` 组合。
 
-## 为什么 `main.cjs` 会被视为真正的问题文件
+5. 用户在 UI 上看到的报错往往是：
 
-因为它不是普通数据文件，而是**发行版实际运行的主进程 bundle**。
+```text
+There's an issue with the selected model (...)
+It may not exist or you may not have access to it.
+```
 
-也就是说：
+但本质不是“模型一定不存在”，而是“当前会话配置被污染了”。
 
-- 它决定 Agent 启动时怎么构造 SDK 配置；
-- 它决定是否允许读取用户级配置；
-- 它决定 `settings.json` 里的污染项有没有机会进入当前会话。
+## 这为什么不应先归因为 SDK 版本兼容问题
 
-因此：
+因为从现有排查结果看：
 
-- 如果 `main.cjs` 还是 `['user', 'project']`，污染就有机会再次发生；
-- 如果 `main.cjs` 改成 `['project']`，即使用户级 `settings.json` 还残留旧值，这条 Agent 运行链路也不会再读进去。
+- 第三方 Anthropic Messages API 链路并没有被证明整体不可用；
+- 报错会随着配置来源的收窄而消失；
+- 一旦把 `settingSources` 从 `['user', 'project']` 收窄为 `['project']`，同类报错就能恢复；
+- 这更像是 **Proma 对 Claude Agent SDK 的配置接入策略** 问题，而不是纯粹的版本 API 不兼容。
 
-## 实际修复方式
+所以更准确的结论是：
 
-这次问题采用的是**最小补丁**方案。
+**这首先是配置来源设计问题，其次才需要结合 SDK 版本变化做额外加固。**
 
-### 修改前
+## 开源版当前并不是“完全没防护”
+
+虽然开源版当前 `settingSources` 仍然是 `['user', 'project']`，但在 `@anthropic-ai/claude-agent-sdk 0.2.111` 下，源码已经针对 **环境变量污染** 做了多层加固。
+
+### 1. 应用启动时先清理 `process.env` 中的 `ANTHROPIC_*`
+
+文件：
+
+- `D:\Proma-Source\apps\electron\src\main\index.ts`
+
+作用：
+
+- 防止本地 shell / 父进程环境中的旧 `ANTHROPIC_*` 一启动就泄漏进 Agent 运行链路。
+
+### 2. `buildSdkEnv()` 再次过滤 `ANTHROPIC_*`
+
+文件：
+
+- `D:\Proma-Source\apps\electron\src\main\lib\agent-orchestrator.ts:423`
+
+作用：
+
+- 从 `process.env` 继承系统变量时，再次剔除所有 `ANTHROPIC_*`；
+- 避免开发环境、本地终端或其他进程的 Anthropic 变量干扰当前渠道配置。
+
+### 3. 显式注入当前会话真正需要的 Anthropic 变量
+
+同文件关键位置：
+
+- `D:\Proma-Source\apps\electron\src\main\lib\agent-orchestrator.ts:442`
+- `D:\Proma-Source\apps\electron\src\main\lib\agent-orchestrator.ts:451`
+- `D:\Proma-Source\apps\electron\src\main\lib\agent-orchestrator.ts:456`
+
+当前策略是：
+
+- 显式写入 `ANTHROPIC_API_KEY`
+- 按需写入规范化后的 `ANTHROPIC_BASE_URL`
+- 显式写入 `CLAUDE_CONFIG_DIR`
+
+### 4. 针对 SDK 0.2.111 的 `options.env` “叠加语义”做空字符串覆盖
+
+同文件关键位置：
+
+- `D:\Proma-Source\apps\electron\src\main\lib\agent-orchestrator.ts:487`
+- `D:\Proma-Source\apps\electron\src\main\lib\agent-orchestrator.ts:491`
+
+背景是：
+
+- SDK `0.2.111` 起，`options.env` 不再是“替换”，而是“叠加到 `process.env` 上”；
+- 因此如果 shell 中还残留 `ANTHROPIC_MODEL`、`ANTHROPIC_CUSTOM_HEADERS` 等，单纯过滤还不够；
+- 现在源码会把 `sdkEnv` 未显式管理的 `ANTHROPIC_*` 设为空字符串，强制覆盖叠加回流。
+
+### 5. 启动 Agent 前再同步一次 `process.env`
+
+同文件关键位置：
+
+- `D:\Proma-Source\apps\electron\src\main\lib\agent-orchestrator.ts:829`
+- `D:\Proma-Source\apps\electron\src\main\lib\agent-orchestrator.ts:830`
+- `D:\Proma-Source\apps\electron\src\main\lib\agent-orchestrator.ts:831`
+- `D:\Proma-Source\apps\electron\src\main\lib\agent-orchestrator.ts:838`
+
+作用：
+
+- 保证当前进程环境与最终传给 SDK 的 `sdkEnv` 尽量一致；
+- 防止 in-process 代码路径绕开 `options.env` 直接读取旧值。
+
+## 所以开源版当前的准确状态是什么
+
+应该区分成两层：
+
+| 层面 | 当前状态 |
+|---|---|
+| `process.env` 型 `ANTHROPIC_*` 污染 | **已有较强加固** |
+| `settingSources` 导致的用户级 settings 污染 | **当前 `main` 仍未彻底切断** |
+
+也就是说，开源版现在不是“完全裸奔”，但也不是“这个问题已经彻底不存在”。
+
+## 历史上开源版其实也做过“只读 project”的修复
+
+从既有排查记录看，开源版历史上确实做过把：
+
+```ts
+settingSources: ['user', 'project']
+```
+
+收窄为：
+
+```ts
+settingSources: ['project']
+```
+
+的修复，目的就是阻断用户级 settings 污染当前 Agent 会话。
+
+但当前 `main` 源码没有保留这一收窄结果，而是仍然开放 `user + project`。
+
+所以：
+
+- **历史上开源版处理过这个问题；**
+- **当前主线源码并不能被简单说成已经彻底解决。**
+
+## 发行版与开源版的关系应该怎么表述
+
+最准确的表述应该是：
+
+### 开源版
+
+- 问题入口主要看源码：
+  - `D:\Proma-Source\apps\electron\src\main\lib\adapters\claude-agent-adapter.ts`
+- 当前主线源码里，`settingSources` 仍允许读取 `user + project`；
+- 同时源码又新增了针对 `process.env` 型 Anthropic 污染的多层加固。
+
+### 发行版
+
+- 问题入口主要看实际 bundle：
+  - `C:\Users\yzjiang\AppData\Local\Programs\Proma\resources\app\dist\main.cjs`
+- 如果这个 bundle 仍是 `user + project`，则最终用户环境里同类问题仍可能复现；
+- 如果这个 bundle 已被补成 `project`，则“用户级 settings 覆盖当前 Agent 会话”这条链路会被切断。
+
+### 用户级污染源
+
+- 两者共用的污染源检查点仍然是：
+  - `C:\Users\yzjiang\.proma\sdk-config\settings.json`
+
+## 最小修复思路应该怎么理解
+
+### 对发行版
+
+如果确认实际运行的 bundle 仍然是：
 
 ```js
 settingSources: ["user", "project"]
 ```
 
-### 修改后
+那么最小补丁仍然是收窄为：
 
 ```js
 settingSources: ["project"]
 ```
 
-### 补丁目标
+补丁文件：
 
-只做一件事：
+- `C:\Users\yzjiang\AppData\Local\Programs\Proma\resources\app\dist\main.cjs`
 
-- **阻断用户级 SDK 配置继续污染当前 Agent 会话**。
+### 对开源版
 
-### 补丁文件
+如果目标是从源码层面彻底堵住“用户级 settings 污染当前 Agent 会话”这条链路，核心位置仍然是：
 
-```text
-C:\Users\yzjiang\AppData\Local\Programs\Proma\resources\app\dist\main.cjs
-```
+- `D:\Proma-Source\apps\electron\src\main\lib\adapters\claude-agent-adapter.ts`
 
-### 配套清理
+同时必须保留当前已经存在的 env 加固逻辑，尤其是：
 
-为降低后续误触发概率，还建议同时检查并清理：
+- `D:\Proma-Source\apps\electron\src\main\index.ts`
+- `D:\Proma-Source\apps\electron\src\main\lib\agent-orchestrator.ts`
 
-```text
-C:\Users\yzjiang\.proma\sdk-config\settings.json
-```
+原因是：
 
-里面残留的旧 `ANTHROPIC_*` 配置。
-
-## 修复前后，用户体感有什么变化
-
-大多数情况下，**用户几乎不会感知到 UI 层面的差异**。
-
-最主要的变化只有一个：
-
-- 修复前：Agent 模式可能会莫名其妙读错配置，表现成 selected model 报错；
-- 修复后：Agent 模式不再被用户级旧配置污染。
-
-换句话说：
-
-- 这不是 UI 改版；
-- 不是功能增加；
-- 不是渠道结构重构；
-- 而是把一个错误的配置读取范围收窄回去。
-
-唯一可能出现的行为差异是：
-
-- 如果有人**原本故意依赖用户级全局 `ANTHROPIC_*` 配置来影响这条 Agent 链路**，那么改成只读 `project` 之后，这种“全局覆盖当前会话”的行为就不会再生效。
-
-但从 Proma 当前的 Agent 设计来看，当前会话中显式选择的渠道、Base URL、模型，本来就应该比用户级旧残留更权威。
+- `settingSources` 修的是 **user settings 污染**；
+- `buildSdkEnv()` / `process.env` 清理修的是 **环境变量叠加污染**；
+- 这两层不是一回事，不能只留一层。
 
 ## 为什么开发者一开始会用 `user + project`
 
-`user + project` 这种配置来源设计，本身在很多 CLI / SDK 系统里都很常见，因为它符合“分层配置”的习惯：
+`user + project` 是一种很常见的分层配置设计：
 
 - `user`：全局默认设置；
 - `project`：当前项目或当前会话的局部覆盖。
 
-这种设计的原始目的通常是：
+它的出发点通常是：
 
-1. 少重复配置；
-2. 允许用户保留全局 API Key / 默认端点；
-3. 再由具体项目做局部覆盖。
+1. 减少重复配置；
+2. 允许保留全局 API Key / 默认端点；
+3. 再由具体项目进行局部覆盖。
 
-### 但为什么在 Proma 这里反而出问题
+但放到 Proma 的 Agent 场景里就有一个问题：
 
-因为 Proma 的 Agent 模式并不是一个“让用户手工运行普通 CLI 项目”的环境。
+- 当前渠道、Base URL、模型本来已经由 UI 显式选中了；
+- 这些当前运行时参数本来应该是最权威的；
+- 再把用户级旧 settings 混进来，只会让当前会话的配置来源变得不透明。
 
-在 Proma 里：
+所以更准确的结论不是“`user + project` 天生错误”，而是：
 
-- 当前渠道是 UI 显式选择的；
-- Base URL 是当前会话明确传入的；
-- 模型也是当前会话明确选中的；
-- 这些当前运行时参数本来就应该是最高优先级。
+**在 Proma 的 Agent 集成链路里，`user + project` 不适合作为默认行为。**
 
-这时再把用户级旧配置读进来，反而会造成：
+## 用户体感上会有什么差异
 
-- 当前选择被旧值覆盖；
-- 会话参数来源变得不透明；
-- 用户看到的报错与真实根因脱节。
+大多数情况下，修复前后**不会有明显 UI 差异**。
 
-所以更准确的结论不是“`user + project` 在所有系统里都错”，而是：
+主要差异只有一个：
 
-**`user + project` 这个通用分层思路，放到 Proma 的 Agent 运行链路里，不适合作为默认行为。**
+- 修复前：Agent 模式可能莫名其妙读错配置，表现成 selected model 报错；
+- 修复后：Agent 模式不再被用户级旧配置或 shell 环境旧值污染。
 
-## 为什么升级或重装后可能复发
+也就是说：
 
-因为当前补丁命中的文件位于发行版安装目录：
+- 不是 UI 改版；
+- 不是功能增加；
+- 不是渠道结构重构；
+- 而是把错误的配置来源收窄或隔离回去。
 
-```text
-C:\Users\yzjiang\AppData\Local\Programs\Proma\resources\app\dist\main.cjs
-```
+## 以后每次更新后应该怎么查
 
-这类文件在以下场景中很容易被覆盖：
+### 如果你在查发行版
 
-- 重装 Proma；
-- 升级发行版；
-- 覆盖安装；
-- 官方新版替换 `resources\app\dist\main.cjs`。
+优先检查：
 
-因此，当前这类补丁如果没有被正式并入发行版本体，就会在后续安装过程中再次丢失。
+1. `C:\Users\yzjiang\AppData\Local\Programs\Proma\resources\app\dist\main.cjs`
+2. `C:\Users\yzjiang\.proma\sdk-config\settings.json`
 
-## 每次更新后建议的最小检查清单
+重点看：
 
-以后每次升级、重装或覆盖安装后，建议按以下顺序快速复查：
+- `main.cjs` 里是不是仍然有 `settingSources: ["user", "project"]`
+- 用户级 SDK 配置中是否仍残留旧 `ANTHROPIC_*`
 
-1. 确认当前问题是不是仍然表现为 Agent 模式 selected model 报错；
-2. 打开：
+### 如果你在查开源版源码
 
-```text
-C:\Users\yzjiang\AppData\Local\Programs\Proma\resources\app\dist\main.cjs
-```
+优先检查：
 
-3. 搜索 `settingSources`；
-4. 如果仍然是：
+1. `D:\Proma-Source\apps\electron\src\main\lib\adapters\claude-agent-adapter.ts`
+2. `D:\Proma-Source\apps\electron\src\main\lib\agent-orchestrator.ts`
+3. `D:\Proma-Source\apps\electron\src\main\index.ts`
+4. `D:\Proma-Source\apps\electron\package.json`
 
-```js
-settingSources: ["user", "project"]
-```
+重点看：
 
-则说明发行版安装目录中的旧逻辑又回来了；
-5. 再检查：
-
-```text
-C:\Users\yzjiang\.proma\sdk-config\settings.json
-```
-
-是否残留旧的 `ANTHROPIC_*`；
-6. 如果确认仍是同类问题，再按既有最小补丁思路处理；
-7. 重启 Proma 后再做实际 Agent 功能复测。
-
-## 在源码仓库里应该关注什么
-
-如果不是检查发行版安装目录，而是在源码仓库中排查本问题，优先关注：
-
-```text
-apps/electron/src/main/lib/adapters/claude-agent-adapter.ts
-```
-
-以及所有与下面这些关键词有关的逻辑：
-
-- `settingSources`
-- Claude Agent SDK 初始化
-- Anthropic 配置来源
-- `ANTHROPIC_*` 环境变量构建
-- Agent 运行时配置叠加顺序
+- `settingSources` 当前是否仍为 `['user', 'project']`
+- `buildSdkEnv()` 是否还保留 `ANTHROPIC_*` 过滤与空字符串覆盖
+- 当前 SDK 版本是否仍为 `0.2.111`
 
 ## 最后结论
 
@@ -284,13 +357,15 @@ apps/electron/src/main/lib/adapters/claude-agent-adapter.ts
 
 请优先想到：
 
-**这很可能不是模型本身的问题，而是 Agent 运行时重新读取了用户级污染配置。**
+**这很可能不是模型本身的问题，而是 Agent 运行时把用户级旧配置或环境变量旧值重新带了回来。**
 
-最应该优先检查的两个位置仍然是：
+最应该优先检查的几个位置是：
 
-1. `C:\Users\yzjiang\AppData\Local\Programs\Proma\resources\app\dist\main.cjs`
-2. `C:\Users\yzjiang\.proma\sdk-config\settings.json`
+1. `D:\Proma-Source\apps\electron\src\main\lib\adapters\claude-agent-adapter.ts`
+2. `D:\Proma-Source\apps\electron\src\main\lib\agent-orchestrator.ts`
+3. `C:\Users\yzjiang\AppData\Local\Programs\Proma\resources\app\dist\main.cjs`
+4. `C:\Users\yzjiang\.proma\sdk-config\settings.json`
 
 而对这个问题最关键的一句话总结仍然是：
 
-**`main.cjs` 里如果允许读取 `user + project`，就可能把用户级旧 `ANTHROPIC_*` 污染重新带回当前 Agent 会话；把它收窄为只读 `project`，就是这次问题的核心修复点。**
+**这不是只有发行版才有的问题；开源版源码和发行版运行产物都与它有关。开源版当前主要是“源码仍放开 user settings、但已加强 env 隔离”，发行版当前主要看“实际运行 bundle 是否仍保留 `user + project`”。**
