@@ -21,11 +21,12 @@ import { existsSync, mkdirSync, symlinkSync, readFileSync, writeFileSync } from 
 import { execFileSync } from 'node:child_process'
 import { createRequire } from 'node:module'
 import { app } from 'electron'
-import type { AgentSendInput, AgentMessage, AgentGenerateTitleInput, AgentProviderAdapter, TypedError, RetryAttempt, SDKMessage, SDKAssistantMessage, AgentStreamPayload, RewindSessionResult } from '@proma/shared'
+import type { AgentSendInput, AgentMessage, AgentGenerateTitleInput, AgentProviderAdapter, TypedError, RetryAttempt, SDKMessage, SDKAssistantMessage, AgentStreamPayload, RewindSessionResult, SdkBeta } from '@proma/shared'
 import { SAFE_TOOLS } from '@proma/shared'
 import type { PermissionRequest, PromaPermissionMode, AskUserRequest, ExitPlanModeRequest } from '@proma/shared'
 import type { ClaudeAgentQueryOptions } from './adapters/claude-agent-adapter'
 import { isPromptTooLongError, friendlyErrorMessage, mapSDKErrorToTypedError, extractErrorDetails } from './adapters/claude-agent-adapter'
+import { isTransientNetworkError } from './error-patterns'
 import { AgentEventBus } from './agent-event-bus'
 import { decryptApiKey, getChannelById, listChannels } from './channel-manager'
 import { getAdapter, fetchTitle, normalizeAnthropicBaseUrlForSdk } from '@proma/core'
@@ -141,10 +142,11 @@ function isAutoRetryableTypedError(error: TypedError): boolean {
   return AUTO_RETRYABLE_ERROR_CODES.has(error.code)
 }
 
-/** 判断 catch 块中的 API 错误是否可自动重试（HTTP 429 / 5xx / 已知可恢复错误模式） */
+/** 判断 catch 块中的 API 错误是否可自动重试（HTTP 429 / 5xx / 已知可恢复错误模式 / 瞬时网络错误） */
 function isAutoRetryableCatchError(
   apiError: { statusCode: number; message: string } | null,
   rawErrorMessage?: string,
+  stderr?: string,
 ): boolean {
   if (apiError) {
     if (apiError.statusCode === 429 || apiError.statusCode >= 500) return true
@@ -153,6 +155,8 @@ function isAutoRetryableCatchError(
   if (rawErrorMessage) {
     if (rawErrorMessage.includes('context_management')) return true
   }
+  // 瞬时网络错误（terminated / ECONNRESET / socket hang up 等）
+  if (isTransientNetworkError(rawErrorMessage, stderr)) return true
   return false
 }
 
@@ -168,11 +172,22 @@ function isSessionNotFoundError(errorMessage: string, stderr?: string): boolean 
 }
 
 /** 最大自动重试次数 */
-const MAX_AUTO_RETRIES = 3
+const MAX_AUTO_RETRIES = 8
 
-/** 计算重试延迟（指数退避：1s, 2s, 4s） */
+/** 重试单次延迟上限（毫秒） */
+const RETRY_MAX_DELAY_MS = 10_000
+
+/**
+ * 计算重试延迟（指数退避 + ±20% jitter）
+ *
+ * 基础序列：1s, 2s, 4s, 8s, 10s, 10s, 10s, 10s（cap = 10s）
+ * 叠加 ±20% 随机抖动，避免大量 session 同时重试造成惊群。
+ * 最坏情况累计等待 ≈ 55s。
+ */
 function getRetryDelayMs(attempt: number): number {
-  return Math.min(1000 * Math.pow(2, attempt - 1), 8000)
+  const base = Math.min(1000 * Math.pow(2, attempt - 1), RETRY_MAX_DELAY_MS)
+  const jitter = base * (Math.random() * 0.4 - 0.2)
+  return Math.max(0, Math.round(base + jitter))
 }
 
 /**
@@ -393,6 +408,21 @@ const DEFAULT_SESSION_TITLE = '新 Agent 会话'
 
 /** 默认模型 ID */
 const DEFAULT_MODEL_ID = 'claude-sonnet-4-5-20250929'
+
+/**
+ * 判断模型是否支持 1M context window beta（context-1m-2025-08-07）
+ * 当前支持：Sonnet 4 / 4.5 / 4.6、Opus 4.6 / 4.7
+ * 参考：https://docs.anthropic.com/en/docs/build-with-claude/context-windows
+ */
+function supports1MContext(modelId: string): boolean {
+  const m = modelId.toLowerCase()
+  if (!m.includes('claude')) return false
+  if (m.includes('haiku')) return false
+  // Sonnet 4+ 与 Opus 4.6+ 都支持
+  if (m.includes('sonnet-4-6')) return true
+  if (m.includes('opus-4-6') || m.includes('opus-4-7')) return true
+  return false
+}
 
 // ===== AgentOrchestrator =====
 
@@ -1272,6 +1302,11 @@ export class AgentOrchestrator {
         ...(appSettings.agentMaxBudgetUsd != null && appSettings.agentMaxBudgetUsd > 0 && {
           maxBudgetUsd: appSettings.agentMaxBudgetUsd,
         }),
+        // 1M context window: 对支持的模型（Opus 4.6/4.7、Sonnet 4.6）自动启用 beta
+        // 未启用时 SDK 默认 200K 并在约 150K 触发压缩；启用后上限提升至 1M
+        ...(supports1MContext(modelId || DEFAULT_MODEL_ID) && {
+          betas: ['context-1m-2025-08-07'] as SdkBeta[],
+        }),
         // 内置 SubAgent 定义（code-reviewer / explorer / researcher）
         // claudeAvailable=false 时 SubAgent 省略 model 字段，自动继承主 Agent 模型
         agents: buildBuiltinAgents(claudeAvailable),
@@ -1779,11 +1814,11 @@ export class AgentOrchestrator {
           }
 
           // 判断是否可重试
-          if (isAutoRetryableCatchError(apiError, rawErrorMessage) && attempt <= MAX_AUTO_RETRIES) {
+          if (isAutoRetryableCatchError(apiError, rawErrorMessage, stderrOutput) && attempt <= MAX_AUTO_RETRIES) {
             lastRetryableError = apiError
               ? `API Error ${apiError.statusCode}: ${apiError.message}`
               : (error instanceof Error ? error.message : '未知错误')
-            console.log(`[Agent 编排] 可重试错误 (catch): ${lastRetryableError}`)
+            console.log(`[Agent 编排] 可重试错误 (catch, attempt ${attempt}/${MAX_AUTO_RETRIES}): ${lastRetryableError}`)
             // 保存部分内容
             this.persistSDKMessages(sessionId, accumulatedMessages, Date.now() - queryStartedAt)
             accumulatedMessages.length = 0
