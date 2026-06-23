@@ -30,13 +30,12 @@ export interface ShortcutDefinition {
   readonly?: boolean
 }
 
-/** 用户自定义快捷键覆盖（持久化到 settings.json） */
-export interface ShortcutOverrides {
-  [shortcutId: string]: {
-    mac?: string
-    win?: string
-  }
-}
+/**
+ * 用户自定义快捷键覆盖（持久化到 settings.json）
+ *
+ * 类型在 `types/settings.ts` 中定义，此处转发以便渲染层就近使用。
+ */
+export type { ShortcutOverrides } from '../../types/settings'
 
 // ===== 分类标签 =====
 
@@ -87,6 +86,14 @@ export const DEFAULT_SHORTCUTS: ShortcutDefinition[] = [
     id: 'global-search',
     name: '全局搜索',
     description: '搜索对话和会话',
+    defaultMac: 'Cmd+Shift+F',
+    defaultWin: 'Ctrl+Shift+F',
+    category: 'navigation',
+  },
+  {
+    id: 'file-find',
+    name: '查找',
+    description: '在对话中搜索消息，或在文件预览/Diff 面板中查找文件内容',
     defaultMac: 'Cmd+F',
     defaultWin: 'Ctrl+F',
     category: 'navigation',
@@ -131,10 +138,10 @@ export const DEFAULT_SHORTCUTS: ShortcutDefinition[] = [
   },
   {
     id: 'stop-generation',
-    name: '停止生成',
+    name: '停止 Agent',
     description: '中断当前 AI 响应',
-    defaultMac: 'Cmd+.',
-    defaultWin: 'Ctrl+.',
+    defaultMac: 'Cmd+Shift+Backspace',
+    defaultWin: 'Ctrl+Shift+Backspace',
     category: 'edit',
   },
   {
@@ -143,6 +150,22 @@ export const DEFAULT_SHORTCUTS: ShortcutDefinition[] = [
     description: '关闭当前活跃的 Chat 或 Agent 标签页',
     defaultMac: 'Cmd+W',
     defaultWin: 'Ctrl+W',
+    category: 'app',
+  },
+  {
+    id: 'toggle-preview-panel',
+    name: '切换预览面板',
+    description: '显示或隐藏内联 Diff/文件预览面板',
+    defaultMac: 'Cmd+\\',
+    defaultWin: 'Ctrl+\\',
+    category: 'navigation',
+  },
+  {
+    id: 'toggle-right-panel',
+    name: '切换文件面板',
+    description: '显示或隐藏右侧文件面板',
+    defaultMac: 'Cmd+Shift+B',
+    defaultWin: 'Ctrl+Shift+B',
     category: 'app',
   },
 
@@ -162,6 +185,15 @@ export const DEFAULT_SHORTCUTS: ShortcutDefinition[] = [
     description: '显示并聚焦 Proma 主窗口',
     defaultMac: 'Cmd+Shift+P',
     defaultWin: 'Ctrl+Shift+P',
+    category: 'global',
+    global: true,
+  },
+  {
+    id: 'voice-dictation',
+    name: '语音输入',
+    description: '唤起豆包流式语音输入浮窗',
+    defaultMac: 'Ctrl+`',
+    defaultWin: 'Ctrl+`',
     category: 'global',
     global: true,
   },

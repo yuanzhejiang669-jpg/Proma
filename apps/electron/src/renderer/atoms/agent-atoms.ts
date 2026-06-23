@@ -6,8 +6,10 @@
  */
 
 import { atom } from 'jotai'
-import { atomFamily } from 'jotai/utils'
-import type { AgentSessionMeta, AgentMessage, AgentEvent, AgentWorkspace, AgentPendingFile, RetryAttempt, PromaPermissionMode, PermissionRequest, AskUserRequest, ExitPlanModeRequest, ThinkingConfig, AgentEffort, TaskUsage, SDKMessage } from '@proma/shared'
+import { atomFamily, atomWithStorage } from 'jotai/utils'
+import type { AgentSessionMeta, AgentEvent, AgentWorkspace, AgentPendingFile, RetryAttempt, PromaPermissionMode, PermissionRequest, AskUserRequest, ExitPlanModeRequest, ThinkingConfig, AgentEffort, SDKMessage, UnstagedChangesResult } from '@proma/shared'
+import { PROMA_DEFAULT_PERMISSION_MODE } from '@proma/shared'
+import { calculateDockBadgeCount, countPendingRequests } from '@/lib/dock-badge-count'
 
 /** 活动状态 */
 export type ActivityStatus = 'pending' | 'running' | 'completed' | 'error' | 'backgrounded'
@@ -37,77 +39,31 @@ export interface ActivityGroup {
   children: ToolActivity[]
 }
 
-/** Teammate 状态枚举 */
-export type TeammateStatus = 'running' | 'completed' | 'failed' | 'stopped'
-
-/** 单个 teammate 的实时状态（Agent Teams 功能） */
-export interface TeammateState {
-  /** SDK task_id */
-  taskId: string
-  /** 关联的 tool_use_id（Task 工具调用 ID） */
-  toolUseId?: string
-  /** 任务描述（spawn 时 Claude 给出的说明） */
-  description: string
-  /** 任务类型（SDK 内部类型，如 in_process_teammate） */
-  taskType?: string
-  /** 在当前对话中的序号（从 1 开始） */
-  index: number
-  /** 当前状态 */
-  status: TeammateStatus
-  /** 最近一次 task_progress 的描述（实时思考内容） */
-  progressDescription?: string
-  /** 当前正在运行的工具名 */
-  currentToolName?: string
-  /** 当前工具已运行秒数 */
-  currentToolElapsedSeconds?: number
-  /** 当前工具 toolUseId */
-  currentToolUseId?: string
-  /** 已使用的工具历史记录（最近 N 个，去重） */
-  toolHistory: string[]
-  /** 完成时的摘要 */
-  summary?: string
-  /** 完成时输出文件路径 */
-  outputFile?: string
-  /** 累计用量 */
-  usage?: TaskUsage
-  /** 开始时间戳 */
-  startedAt: number
-  /** 结束时间戳 */
-  endedAt?: number
-}
-
-/** 工具历史最大记录数 */
-const MAX_TOOL_HISTORY = 20
-
 /**
- * 将流式状态中未完成的 toolActivities 和 running teammates 标记为终态。
+ * 将流式状态中未完成的 toolActivities 标记为终态。
  * 用于 complete、handleStop、STREAM_COMPLETE 等多个终态入口的兜底清理。
  * 当所有项已处于终态时返回原引用，避免不必要的 React 重渲染。
  */
 export function finalizeStreamingActivities(
   toolActivities: ToolActivity[],
-  teammates: TeammateState[]
-): { toolActivities: ToolActivity[]; teammates: TeammateState[] } {
+): { toolActivities: ToolActivity[] } {
   const hasUnfinishedTools = toolActivities.some((ta) => !ta.done)
-  const hasRunningTeammates = teammates.some((tm) => tm.status === 'running')
 
   return {
     toolActivities: hasUnfinishedTools
       ? toolActivities.map((ta) => (ta.done ? ta : { ...ta, done: true }))
       : toolActivities,
-    teammates: hasRunningTeammates
-      ? teammates.map((tm) =>
-          tm.status === 'running'
-            ? { ...tm, status: 'stopped' as const, endedAt: Date.now(), currentToolName: undefined, currentToolElapsedSeconds: undefined, currentToolUseId: undefined }
-            : tm
-        )
-      : teammates,
   }
 }
 
 /** Agent 会话的流式状态 */
 export interface AgentStreamState {
   running: boolean
+  /**
+   * 后台任务等待态（软空闲）：本轮主体已结束、UI 可输入，但 SDK 通道仍开着等后台任务唤醒。
+   * 此状态下 running 为 false，但服务端 activeSessions 仍保留，新消息必须走注入通道而非新建 run。
+   */
+  backgroundWaiting?: boolean
   content: string
   toolActivities: ToolActivity[]
   model?: string
@@ -123,6 +79,10 @@ export interface AgentStreamState {
   costUsd?: number
   /** 模型上下文窗口大小 */
   contextWindow?: number
+  /** 当前 thinking block 的 token 估算值（SDK 实时估算，非计费值） */
+  thinkingEstimatedTokens?: number
+  /** usage 数据最后更新时间戳（毫秒），用于 UI 提示数据时效 */
+  usageUpdatedAt?: number
   /** 是否正在压缩上下文 */
   isCompacting?: boolean
   /**
@@ -144,10 +104,6 @@ export interface AgentStreamState {
     /** 是否已失败 */
     failed: boolean
   }
-  /** Agent Teams: teammate 状态列表 */
-  teammates: TeammateState[]
-  /** 是否等待 auto-resume（teammate 结果收集中） */
-  waitingResume?: boolean
 }
 
 /** 从 ToolActivity 派生状态 */
@@ -241,6 +197,7 @@ export function isActivityGroup(item: ActivityGroup | ToolActivity): item is Act
 export interface AgentPendingPrompt {
   sessionId: string
   message: string
+  additionalDirectories?: string[]
 }
 
 // ===== Atoms =====
@@ -248,6 +205,8 @@ export interface AgentPendingPrompt {
 export const agentSessionsAtom = atom<AgentSessionMeta[]>([])
 export const agentWorkspacesAtom = atom<AgentWorkspace[]>([])
 export const currentAgentWorkspaceIdAtom = atom<string | null>(null)
+/** 侧栏「自动任务」合成项目组在项目列表中的位置索引（默认 0 = 最靠前；从 settings.json 加载） */
+export const automationGroupOrderAtom = atom<number>(0)
 /** 全局默认渠道 ID（新会话继承用，从 settings.json 加载） */
 export const agentChannelIdAtom = atom<string | null>(null)
 /** 全局默认模型 ID（新会话继承用，从 settings.json 加载） */
@@ -260,8 +219,25 @@ export const agentSessionChannelMapAtom = atom<Map<string, string>>(new Map())
 /** Per-session 模型 ID Map — sessionId → modelId */
 export const agentSessionModelMapAtom = atom<Map<string, string>>(new Map())
 export const currentAgentSessionIdAtom = atom<string | null>(null)
-export const currentAgentMessagesAtom = atom<AgentMessage[]>([])
 export const agentStreamingStatesAtom = atom<Map<string, AgentStreamState>>(new Map())
+
+/** Agent 流式结束后是否保持过程组展开，默认收起以降低结果阅读干扰 */
+export const agentProcessGroupsKeepExpandedAtom = atomWithStorage<boolean>(
+  'proma-agent-process-groups-keep-expanded',
+  false,
+)
+
+/**
+ * 单个 session 的 streaming state 派生 atomFamily — 按 sessionId 切片订阅。
+ *
+ * 直接订阅 agentStreamingStatesAtom 会让任意 session 的流式更新都触发 AgentView
+ * 整树重渲染（10–30fps）。本 family 让订阅者只在本 session 的 state 引用变化时
+ * 重渲染——其他 session 的更新虽然让 base atom 变化，但派生 atom 输出引用未变，
+ * jotai 自动跳过通知。
+ */
+export const agentSessionStreamingStateAtomFamily = atomFamily((sessionId: string) =>
+  atom((get) => get(agentStreamingStatesAtom).get(sessionId)),
+)
 
 /**
  * 实时 SDKMessage 累积 Map — Phase 2 新增
@@ -273,8 +249,35 @@ export const liveMessagesMapAtom = atom<Map<string, SDKMessage[]>>(new Map())
 
 export const agentPendingPromptAtom = atom<AgentPendingPrompt | null>(null)
 
-/** Agent 待发送文件列表 */
-export const agentPendingFilesAtom = atom<AgentPendingFile[]>([])
+/**
+ * Agent 待发送文件列表 Map — 以 sessionId 为 key
+ * 切换会话时保留各 session 自己的 pending files，与文字草稿语义一致
+ */
+export const agentSessionPendingFilesAtom = atom<Map<string, AgentPendingFile[]>>(new Map())
+
+/**
+ * 单个 session 的 pending files 派生 atom（读写）— 按 sessionId 切片
+ * read：返回当前 session 的数组（空数组兜底）
+ * write：接受新数组或 updater 函数，写回时空数组转为 delete，避免 Map 长期残留空 entry
+ */
+export const agentPendingFilesAtomFamily = atomFamily((sessionId: string) =>
+  atom(
+    (get) => get(agentSessionPendingFilesAtom).get(sessionId) ?? [],
+    (_get, set, update: AgentPendingFile[] | ((prev: AgentPendingFile[]) => AgentPendingFile[])) => {
+      set(agentSessionPendingFilesAtom, (prev) => {
+        const current = prev.get(sessionId) ?? []
+        const next = typeof update === 'function' ? update(current) : update
+        const map = new Map(prev)
+        if (next.length === 0) {
+          map.delete(sessionId)
+        } else {
+          map.set(sessionId, next)
+        }
+        return map
+      })
+    },
+  ),
+)
 
 /** 工作区能力版本号 — 每次修改 MCP/Skills 后自增，触发侧边栏重新获取 */
 export const workspaceCapabilitiesVersionAtom = atom(0)
@@ -284,14 +287,47 @@ export const workspaceFilesVersionAtom = atom(0)
 
 // ===== 侧面板 Atoms =====
 
-/** 侧面板是否打开（per-session Map） */
+/** 侧面板是否打开（全局共享，所有会话共用一个状态） */
+export const agentSidePanelOpenAtom = atomWithStorage<boolean>('proma-agent-sidepanel-open', true)
+
+/** 侧面板宽度（全局共享，用户拖拽后持久化） */
+export const agentSidePanelWidthAtom = atomWithStorage<number>('proma-agent-sidepanel-width', 280)
+
+/** @deprecated 保留以兼容旧代码，但实际所有 session 都读全局 atom */
 export const agentSidePanelOpenMapAtom = atom<Map<string, boolean>>(new Map())
 
-/** 当前会话的侧面板是否打开（派生只读，供 AppShell 使用，避免全 Map 订阅导致无关重渲染） */
+/** 侧面板当前 Tab：'session' | 'workspace' | 'changes'（per-session Map） */
+export const agentDiffPanelTabAtom = atom<Map<string, 'session' | 'workspace' | 'changes'>>(new Map())
+
+/** Diff 视图模式：'split' | 'unified' */
+export const agentDiffViewModeAtom = atom<'split' | 'unified'>('split')
+
+/** Diff 刷新版本号 — 按 session 隔离，Agent 写工具完成时递增 */
+export const agentDiffRefreshVersionAtom = atom(new Map<string, number>())
+
+/** 当前会话选中的 worktree 路径，null = 默认行为（显示 session 改动） */
+export const agentSelectedWorktreeAtom = atom(new Map<string, string | null>())
+
+/** 是否有未查看的代码改动 — 按 session 隔离 */
+export const agentDiffUnseenChangesAtom = atom(new Map<string, boolean>())
+
+/** Agent 本轮刚修改但用户尚未查看的文件路径 — 按 session 隔离，Map<sessionId, Set<filePath>> */
+export const agentDiffUnseenFilesAtom = atom(new Map<string, Set<string>>())
+
+/**
+ * Diff 数据缓存 — 按 session 隔离，存放上一次 IPC 拉取到的未暂存改动结果。
+ *
+ * 让 DiffChangesList 切走再切回时能立即拿到旧数据渲染（SWR 模式），
+ * 避免 mount 时空数组误命中"没有代码改动"分支造成 ~1s 闪烁。
+ * 数据新鲜度由 [[agentDiffRefreshVersionAtom]] 触发的后台 fetch 维护，无 TTL。
+ */
+export const agentDiffDataAtom = atom(new Map<string, UnstagedChangesResult>())
+
+/** 当前会话的侧面板是否打开（派生只读：全局共享，但仅在有当前会话且为 Agent 模式时显示） */
 export const currentSessionSidePanelOpenAtom = atom<boolean>((get) => {
   const currentId = get(currentAgentSessionIdAtom)
   if (!currentId) return false
-  return get(agentSidePanelOpenMapAtom).get(currentId) ?? true
+  return get(agentSidePanelOpenAtom)
 })
 
 /** 当前会话的工作路径 Map — sessionId → path */
@@ -306,6 +342,8 @@ export interface FileBrowserAutoReveal {
   sessionId: string
   path: string
   ts: number
+  /** 是否同时将文件设为选中态 */
+  select?: boolean
 }
 export const fileBrowserAutoRevealAtom = atom<FileBrowserAutoReveal | null>(null)
 
@@ -321,11 +359,31 @@ export const RECENTLY_MODIFIED_TTL_MS = 60_000
 
 // ===== 权限系统 Atoms =====
 
-/** 工作区默认权限模式（初始化和新会话使用） */
-export const agentDefaultPermissionModeAtom = atom<PromaPermissionMode>('acceptEdits')
+/** 新会话默认权限模式 */
+export const agentDefaultPermissionModeAtom = atom<PromaPermissionMode>(PROMA_DEFAULT_PERMISSION_MODE)
 
 /** Per-session 权限模式 Map — sessionId → PromaPermissionMode */
 export const agentPermissionModeMapAtom = atom<Map<string, PromaPermissionMode>>(new Map())
+
+/**
+ * 按 sessionId 派生该 session 的持久化权限模式。
+ * 返回 `undefined`（session 不存在或未设置）或具体的 PromaPermissionMode 字符串，
+ * jotai 用 === 比较，只有值真正变化时才通知下游——避免流式中无关字段更新引发 re-render。
+ */
+export const sessionPersistedPermissionModeAtom = atomFamily((sessionId: string) =>
+  atom((get) => {
+    const sessions = get(agentSessionsAtom)
+    return sessions.find((s) => s.id === sessionId)?.permissionMode
+  }),
+)
+
+/** 按 sessionId 派生该 session 是否存在于列表中（冷启动判断用） */
+export const sessionExistsAtom = atomFamily((sessionId: string) =>
+  atom((get) => {
+    const sessions = get(agentSessionsAtom)
+    return sessions.some((s) => s.id === sessionId)
+  }),
+)
 
 /** Agent 思考模式 */
 export const agentThinkingAtom = atom<ThinkingConfig | undefined>(undefined)
@@ -367,6 +425,23 @@ export const pendingPermissionRequestsAtom = atom(
 
 /** 待处理的 AskUser 请求 Map — 以 sessionId 为 key，切换会话时保留状态 */
 export const allPendingAskUserRequestsAtom = atom<Map<string, readonly AskUserRequest[]>>(new Map())
+
+/** AskUser 单题答案草稿 */
+export interface AskUserQuestionDraft {
+  selected: string[]
+  customText: string
+  showCustom: boolean
+}
+
+/** AskUser 请求级草稿 — 以 requestId 为 key，组件卸载后仍保留 */
+export interface AskUserRequestDraft {
+  activeTab: number
+  focusedOptIdx: number
+  answers: Map<number, AskUserQuestionDraft>
+}
+
+/** 待提交 AskUser 草稿 Map — 以 requestId 为 key，切换预览/会话时保留填写进度 */
+export const askUserDraftsAtom = atom<Map<string, AskUserRequestDraft>>(new Map())
 
 type AskUserRequestsUpdate = readonly AskUserRequest[] | ((prev: readonly AskUserRequest[]) => readonly AskUserRequest[])
 
@@ -455,8 +530,27 @@ export type SessionIndicatorStatus = 'idle' | 'running' | 'blocked' | 'completed
 /** 已完成但用户尚未查看的会话 ID 集合 */
 export const unviewedCompletedSessionIdsAtom = atom<Set<string>>(new Set<string>())
 
-/** Working 区域"已完成"组：本次 App 会话中完成且 Tab 仍打开的会话 ID（关闭 Tab 时移除） */
-export const workingDoneSessionIdsAtom = atom<Set<string>>(new Set<string>())
+let lastIndicatorSignature = ''
+let lastIndicatorMap = new Map<string, SessionIndicatorStatus>()
+
+function getStableIndicatorMap(entries: Array<[string, SessionIndicatorStatus]>): Map<string, SessionIndicatorStatus> {
+  entries.sort(([a], [b]) => a.localeCompare(b))
+  const signature = entries.map(([id, status]) => `${id}:${status}`).join('|')
+  if (signature === lastIndicatorSignature) return lastIndicatorMap
+  lastIndicatorSignature = signature
+  lastIndicatorMap = new Map(entries)
+  return lastIndicatorMap
+}
+
+/** Dock/Launcher 角标数量：未查看完成会话 + 待处理阻塞请求 */
+export const dockBadgeCountAtom = atom<number>((get) => {
+  return calculateDockBadgeCount({
+    unviewedCompletedCount: get(unviewedCompletedSessionIdsAtom).size,
+    pendingPermissionCount: countPendingRequests(get(allPendingPermissionRequestsAtom)),
+    pendingAskUserCount: countPendingRequests(get(allPendingAskUserRequestsAtom)),
+    pendingExitPlanCount: countPendingRequests(get(allPendingExitPlanRequestsAtom)),
+  })
+})
 
 /**
  * 每个会话的指示点状态（只包含非 idle 的会话）
@@ -485,18 +579,8 @@ export const agentSessionIndicatorMapAtom = atom<Map<string, SessionIndicatorSta
     }
   }
 
-  return map
+  return getStableIndicatorMap(Array.from(map.entries()))
 })
-
-/**
- * 追加工具名到历史记录（不可变版本）
- * 相同工具不连续重复，超出上限则删除最旧的
- */
-function appendToolHistory(history: string[], toolName: string): string[] {
-  if (history[history.length - 1] === toolName) return history
-  const next = [...history, toolName]
-  return next.length > MAX_TOOL_HISTORY ? next.slice(next.length - MAX_TOOL_HISTORY) : next
-}
 
 /**
  * 处理 AgentEvent 并更新流式状态（纯函数）
@@ -565,37 +649,6 @@ export function applyAgentEvent(
       }
 
     case 'task_progress':
-      // Teams 级别的 teammate 进度（带 taskId）
-      if (event.taskId) {
-        const tmIdx = prev.teammates.findIndex((t) => t.taskId === event.taskId)
-        if (tmIdx >= 0) {
-          const tm = prev.teammates[tmIdx]!
-          const updatedTm: TeammateState = {
-            ...tm,
-            progressDescription: event.description ?? tm.progressDescription,
-            usage: event.usage ?? tm.usage,
-            // 更新当前工具名和计时（来自 tool_progress 或 system task_progress）
-            ...(event.lastToolName && {
-              currentToolName: event.lastToolName,
-              currentToolElapsedSeconds: event.elapsedSeconds ?? tm.currentToolElapsedSeconds,
-              currentToolUseId: event.toolUseId,
-              toolHistory: appendToolHistory(tm.toolHistory, event.lastToolName),
-            }),
-            // 无 lastToolName 但有真实 elapsedSeconds 时仅更新计时
-            ...(!event.lastToolName && event.elapsedSeconds != null && {
-              currentToolElapsedSeconds: event.elapsedSeconds,
-            }),
-            // 主对话仍在运行时，收到进度说明 teammate 实际仍在工作，重置 stopped/failed
-            // 主对话已结束时（running: false），不重置（防止建议信息等后续事件错误唤醒）
-            ...(prev.running && (tm.status === 'stopped' || tm.status === 'failed')
-              ? { status: 'running' as const, endedAt: undefined }
-              : {}),
-          }
-          const nextTeammates = [...prev.teammates]
-          nextTeammates[tmIdx] = updatedTm
-          return { ...prev, teammates: nextTeammates }
-        }
-      }
       // 普通 tool 计时语义（仅当有真实 elapsedSeconds 时更新）
       if (event.elapsedSeconds != null) {
         return {
@@ -613,8 +666,7 @@ export function applyAgentEvent(
       // 查找匹配 toolUseId 的 ToolActivity，更新 intent 和 taskId
       let nextActivities = prev.toolActivities
       if (event.toolUseId) {
-        const idx = prev.toolActivities.findIndex((t) => t.toolUseId === event.toolUseId)
-        if (idx >= 0) {
+        if (prev.toolActivities.some((t) => t.toolUseId === event.toolUseId)) {
           nextActivities = prev.toolActivities.map((t) =>
             t.toolUseId === event.toolUseId
               ? { ...t, intent: event.description, taskId: event.taskId }
@@ -622,26 +674,7 @@ export function applyAgentEvent(
           )
         }
       }
-      // 去重：已有同 taskId 的 teammate 时仅更新 activities
-      if (prev.teammates.some((t) => t.taskId === event.taskId)) {
-        return { ...prev, toolActivities: nextActivities }
-      }
-      // 创建 TeammateState
-      const newTeammate: TeammateState = {
-        taskId: event.taskId,
-        toolUseId: event.toolUseId,
-        description: event.description,
-        taskType: event.taskType,
-        index: prev.teammates.length + 1,
-        status: 'running',
-        toolHistory: [],
-        startedAt: Date.now(),
-      }
-      return {
-        ...prev,
-        toolActivities: nextActivities,
-        teammates: [...prev.teammates, newTeammate],
-      }
+      return { ...prev, toolActivities: nextActivities }
     }
 
     case 'shell_backgrounded':
@@ -657,58 +690,59 @@ export function applyAgentEvent(
     case 'shell_killed':
       return prev
 
-    case 'task_notification': {
-      // Agent Teams: teammate 完成/失败/停止
-      const nextTeammates = [...prev.teammates]
-      let tmIdx = nextTeammates.findIndex((t) => t.taskId === event.taskId)
-      if (tmIdx < 0) {
-        // task_started 丢失时的兜底：从 notification 补创 teammate
-        nextTeammates.push({
-          taskId: event.taskId,
-          toolUseId: event.toolUseId,
-          description: event.summary || event.taskId,
-          index: nextTeammates.length + 1,
-          status: 'running',
-          toolHistory: [],
-          startedAt: Date.now(),
-        })
-        tmIdx = nextTeammates.length - 1
+    case 'task_notification':
+      return prev
+
+    case 'thinking_tokens':
+      return {
+        ...prev,
+        thinkingEstimatedTokens: event.estimatedTokens,
       }
-      nextTeammates[tmIdx] = {
-        ...nextTeammates[tmIdx]!,
-        status: event.status,
-        summary: event.summary,
-        outputFile: event.outputFile,
-        endedAt: Date.now(),
-        ...(event.usage && { usage: event.usage }),
-        // 任务结束后清除实时工具状态
-        currentToolName: undefined,
-        currentToolElapsedSeconds: undefined,
-        currentToolUseId: undefined,
-      }
-      return { ...prev, teammates: nextTeammates }
-    }
 
     case 'tool_use_summary':
       // 工具使用摘要 — 目前不影响流式状态，仅用于 UI 展示
       return prev
 
-    case 'waiting_resume':
-      return { ...prev, waitingResume: true }
-
-    case 'resume_start':
-      return { ...prev, waitingResume: false }
-
-    case 'complete':
+    case 'complete': {
       // 成功完成 — 清除 retrying，但保持 running: true
       // 等待 STREAM_COMPLETE IPC 回调通过删除流式状态来控制 UI 就绪状态
       // 这避免了用户在后端尚未完成清理时就能发送新消息的竞态条件
-      // 同时将仍 running 的 teammates 标记为 stopped、未完成的工具活动标记为 done（兜底）
+      // 同时将未完成的工具活动标记为 done（兜底）
+      //
+      // token 计数（inputTokens / 缓存 / outputTokens）默认只信任流式中每条 assistant
+      // 消息的 usage_update：单条模型调用的 input+缓存 ≈ 当轮完整 prompt = 当前真实上下文。
+      // SDK 的 result.usage 是整个 query 内所有模型调用的累计求和（cache_read 会被累加 N 次），
+      // 直接覆盖会让进度环虚高、冲破 100%（PR #821 修的正是这个问题）。
+      //
+      // 但 GLM-5.2 等走 Anthropic 兼容端点的渠道，流式 assistant 消息不携带 usage 字段，
+      // 真实值只在 result 中返回。若完全不用 result.usage，这些渠道的 ContextUsageBadge
+      // 永远停留在 inputTokens=0 不显示。
+      //
+      // 折中：仅当「整个 query 期间从未收到流式 usage_update」（prev.inputTokens 为空/0）
+      // 才从 result.usage 兜底写入 token 字段；已有流式真实值时不动。
+      // - contextWindow：始终覆盖（result 才是权威分母）
+      // - costUsd：始终覆盖（本就该是整轮累计成本）
+      const needResultFallback = !prev.inputTokens || prev.inputTokens <= 0
       return {
         ...prev,
+        ...(event.usage ? {
+          ...(event.usage.costUsd != null && { costUsd: event.usage.costUsd }),
+          ...(event.usage.contextWindow != null && { contextWindow: event.usage.contextWindow }),
+          ...(event.usage.contextWindow != null && { usageUpdatedAt: Date.now() }),
+          ...(needResultFallback && event.usage.inputTokens != null && { inputTokens: event.usage.inputTokens }),
+          ...(needResultFallback && event.usage.outputTokens != null && { outputTokens: event.usage.outputTokens }),
+          ...(needResultFallback && event.usage.cacheReadTokens != null && { cacheReadTokens: event.usage.cacheReadTokens }),
+          ...(needResultFallback && event.usage.cacheCreationTokens != null && { cacheCreationTokens: event.usage.cacheCreationTokens }),
+          ...(needResultFallback && { usageUpdatedAt: Date.now() }),
+        } : {}),
         retrying: undefined,
-        ...finalizeStreamingActivities(prev.toolActivities, prev.teammates),
+        ...finalizeStreamingActivities(prev.toolActivities),
       }
+    }
+
+    case 'run_resumed':
+      // 后台任务完成自动唤醒：从"空闲可输入"恢复到运行态（防御性，监听器已显式处理）。
+      return { ...prev, running: true, backgroundWaiting: false }
 
     case 'typed_error':
       // 处理类型化错误（TypedError）
@@ -723,12 +757,15 @@ export function applyAgentEvent(
     case 'usage_update':
       return {
         ...prev,
-        inputTokens: event.usage.inputTokens,
+        ...(event.usage.inputTokens != null && { inputTokens: event.usage.inputTokens }),
         ...(event.usage.outputTokens != null && { outputTokens: event.usage.outputTokens }),
         ...(event.usage.cacheReadTokens != null && { cacheReadTokens: event.usage.cacheReadTokens }),
         ...(event.usage.cacheCreationTokens != null && { cacheCreationTokens: event.usage.cacheCreationTokens }),
         ...(event.usage.costUsd != null && { costUsd: event.usage.costUsd }),
-        ...(event.usage.contextWindow && { contextWindow: event.usage.contextWindow }),
+        // 流式中 assistant 消息的 usage_update 可能携带推断的 contextWindow，
+        // 若已有 result 消息提供的真实值，则不再覆盖
+        ...(event.usage.contextWindow && !prev.contextWindow && { contextWindow: event.usage.contextWindow }),
+        usageUpdatedAt: Date.now(),
       }
 
     case 'compacting':
@@ -821,6 +858,8 @@ export interface AgentContextStatus {
   cacheCreationTokens?: number
   costUsd?: number
   contextWindow?: number
+  /** usage 数据最后更新时间戳（毫秒） */
+  usageUpdatedAt?: number
 }
 
 /** 当前会话的上下文使用量派生 atom */
@@ -836,6 +875,7 @@ export const agentContextStatusAtom = atom<AgentContextStatus>((get) => {
     cacheCreationTokens: state?.cacheCreationTokens,
     costUsd: state?.costUsd,
     contextWindow: state?.contextWindow,
+    usageUpdatedAt: state?.usageUpdatedAt,
   }
 })
 
@@ -852,6 +892,39 @@ export const agentStreamErrorsAtom = atom<Map<string, string>>(new Map())
  */
 export const agentMessageRefreshAtom = atom<Map<string, number>>(new Map())
 
+/**
+ * 持久化 SDKMessage 的内存缓存 Map — 以 sessionId 为 key
+ * 用于消除「切换会话时先清空 → 等待 IPC 全量读盘」的可见空窗：
+ * 命中缓存可立即填充消息区，IPC 返回后再覆盖为最新数据。
+ *
+ * 内存安全：缓存条目随会话数增长会无限膨胀（长会话的消息数组很大），
+ * 因此通过 setSessionMessagesCache 做 LRU 淘汰，仅保留最近访问的
+ * AGENT_MSG_CACHE_MAX 个会话；会话删除时也需主动剔除对应条目。
+ */
+export const AGENT_MSG_CACHE_MAX = 20
+export const agentSDKMessagesCacheAtom = atom<Map<string, SDKMessage[]>>(new Map())
+
+/**
+ * 写入会话消息缓存并执行 LRU 淘汰。
+ * 利用 JS Map 的插入顺序：删除已存在的 key 再重新 set，使其移到「最新」位置；
+ * 超出上限时从头部（最旧）删除，直到回到上限内。返回新的 Map（不可变更新）。
+ */
+export function setSessionMessagesCache(
+  prev: Map<string, SDKMessage[]>,
+  sessionId: string,
+  messages: SDKMessage[],
+): Map<string, SDKMessage[]> {
+  const next = new Map(prev)
+  next.delete(sessionId)
+  next.set(sessionId, messages)
+  while (next.size > AGENT_MSG_CACHE_MAX) {
+    const oldest = next.keys().next().value
+    if (oldest === undefined) break
+    next.delete(oldest)
+  }
+  return next
+}
+
 /** 当前 Agent 会话的错误消息（派生只读原子） */
 export const currentAgentErrorAtom = atom<string | null>((get) => {
   const currentId = get(currentAgentSessionIdAtom)
@@ -865,11 +938,21 @@ export const currentAgentErrorAtom = atom<string | null>((get) => {
  */
 export const agentSessionDraftsAtom = atom<Map<string, string>>(new Map())
 
+/** 单个 session 的 markdown 草稿派生 atom — 按 sessionId 切片订阅 */
+export const agentSessionDraftAtomFamily = atomFamily((sessionId: string) =>
+  atom((get) => get(agentSessionDraftsAtom).get(sessionId) ?? ''),
+)
+
 /**
  * Agent 会话输入框 HTML 草稿 Map — 以 sessionId 为 key
  * 保存 TipTap 编辑器的原始 HTML，用于切换会话时恢复 mention 等富文本节点
  */
 export const agentSessionDraftHtmlAtom = atom<Map<string, string>>(new Map())
+
+/** 单个 session 的 HTML 草稿派生 atom — 按 sessionId 切片订阅 */
+export const agentSessionDraftHtmlAtomFamily = atomFamily((sessionId: string) =>
+  atom((get) => get(agentSessionDraftHtmlAtom).get(sessionId) ?? ''),
+)
 
 /**
  * 会话附加目录 Map — 以 sessionId 为 key
@@ -879,11 +962,24 @@ export const agentSessionDraftHtmlAtom = atom<Map<string, string>>(new Map())
 export const agentAttachedDirectoriesMapAtom = atom<Map<string, string[]>>(new Map())
 
 /**
+ * 会话附加文件 Map — 以 sessionId 为 key
+ * 存储每个会话通过"附加文件"功能关联的外部文件路径列表。
+ */
+export const agentAttachedFilesMapAtom = atom<Map<string, string[]>>(new Map())
+
+/**
  * 工作区级附加目录列表（按 workspaceId 存储）
  *
  * 工作区内所有会话共享这些附加目录。
  */
 export const workspaceAttachedDirectoriesMapAtom = atom<Map<string, string[]>>(new Map())
+
+/**
+ * 工作区级附加文件列表（按 workspaceId 存储）
+ *
+ * 工作区内所有会话共享这些附加文件。
+ */
+export const workspaceAttachedFilesMapAtom = atom<Map<string, string[]>>(new Map())
 
 /** 当前 Agent 会话的草稿内容（派生读写原子） */
 export const currentAgentSessionDraftAtom = atom(
@@ -931,7 +1027,7 @@ export interface BackgroundTask {
   id: string
   /** 任务类型 */
   type: 'agent' | 'shell'
-  /** 关联的工具调用 ID（用于滚动定位到 ToolActivityItem） */
+  /** 关联的工具调用 ID（用于滚动定位到实时工具调用） */
   toolUseId: string
   /** 任务开始时间戳 */
   startTime: number

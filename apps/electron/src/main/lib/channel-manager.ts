@@ -21,9 +21,11 @@ import type {
   FetchModelsResult,
   ProviderType,
 } from '@proma/shared'
+import { PROVIDER_DEFAULT_URLS } from '@proma/shared'
 import { getFetchFn } from './proxy-fetch'
 import { getEffectiveProxyUrl } from './proxy-settings-service'
-import { normalizeAnthropicBaseUrl, normalizeBaseUrl } from '@proma/core'
+import { normalizeBaseUrl, normalizeAnthropicProviderUrl, getPromaUserAgent } from '@proma/core'
+import pkg from '../../../package.json' with { type: 'json' }
 
 /** 当前配置版本 */
 const CONFIG_VERSION = 1
@@ -106,9 +108,37 @@ function decryptKey(encryptedKey: string): string {
  * 获取所有渠道
  *
  * 返回的渠道中 apiKey 保持加密状态。
+ * 首次调用时，如果没有任何 DeepSeek 渠道，自动创建预设渠道。
  */
 export function listChannels(): Channel[] {
   const config = readConfig()
+
+  // 首次使用：如果没有 DeepSeek 渠道，自动创建预设
+  const hasDeepSeek = config.channels.some(
+    (c) => c.provider === 'deepseek' || c.baseUrl.includes('api.deepseek.com'),
+  )
+  if (!hasDeepSeek) {
+    const now = Date.now()
+    const presetChannel: Channel = {
+      id: randomUUID(),
+      name: 'DeepSeek',
+      provider: 'deepseek',
+      baseUrl: PROVIDER_DEFAULT_URLS.deepseek,
+      apiKey: encryptApiKey(''),
+      models: [
+        { id: 'deepseek-v4-pro', name: 'DeepSeek V4 Pro', enabled: true },
+        { id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash', enabled: true },
+      ],
+      enabled: false,
+      createdAt: now,
+      updatedAt: now,
+    }
+    config.channels.push(presetChannel)
+    writeConfig(config)
+    console.log('[渠道管理] 已自动创建 DeepSeek 预设渠道')
+    return config.channels
+  }
+
   return config.channels
 }
 
@@ -238,12 +268,18 @@ export async function testChannel(channelId: string): Promise<ChannelTestResult>
   try {
     switch (channel.provider) {
       case 'anthropic':
-        return await testAnthropic(channel.baseUrl, apiKey, proxyUrl)
-      case 'openai':
+      case 'anthropic-compatible':
       case 'deepseek':
-      case 'moonshot':
-      case 'zhipu':
+      case 'kimi-api':
+      case 'kimi-coding':
+      case 'zhipu-coding':
       case 'minimax':
+      case 'xiaomi':
+      case 'xiaomi-token-plan':
+      case 'qwen-anthropic':
+        return await testAnthropicCompatible(channel.baseUrl, apiKey, proxyUrl, channel.provider)
+      case 'openai':
+      case 'zhipu':
       case 'doubao':
       case 'qwen':
       case 'custom':
@@ -260,22 +296,70 @@ export async function testChannel(channelId: string): Promise<ChannelTestResult>
 }
 
 /**
- * 测试 Anthropic API 连接
+ * 测试 Anthropic 兼容 API 连接（Anthropic / DeepSeek / Kimi API / Kimi Coding Plan / MiniMax）
+ *
+ * DeepSeek / Kimi 的 Anthropic API 端点无需 /v1 前缀。
+ * Kimi Coding Plan 必须发送 Proma User-Agent，否则返回 403。
  */
-async function testAnthropic(baseUrl: string, apiKey: string, proxyUrl?: string): Promise<ChannelTestResult> {
-  const url = normalizeAnthropicBaseUrl(baseUrl)
+async function testAnthropicCompatible(
+  baseUrl: string,
+  apiKey: string,
+  proxyUrl?: string,
+  provider: ProviderType = 'anthropic',
+): Promise<ChannelTestResult> {
+  const url = normalizeAnthropicProviderUrl(baseUrl, provider)
   const fetchFn = getFetchFn(proxyUrl)
+
+  let testModel: string
+  switch (provider) {
+    case 'deepseek':
+      testModel = 'deepseek-v4-pro'
+      break
+    case 'kimi-api':
+      testModel = 'kimi-k2.6'
+      break
+    case 'kimi-coding':
+      testModel = 'kimi-for-coding'
+      break
+    case 'zhipu-coding':
+      testModel = 'glm-5.2'
+      break
+    case 'minimax':
+      testModel = 'MiniMax-M3'
+      break
+    case 'xiaomi':
+    case 'xiaomi-token-plan':
+      testModel = 'mimo-v2.5-pro'
+      break
+    case 'qwen-anthropic':
+      testModel = 'qwen3.7-plus'
+      break
+    default:
+      testModel = 'claude-sonnet-4-6'
+  }
+
+  const headers: Record<string, string> = {
+    'anthropic-version': '2023-06-01',
+    'content-type': 'application/json',
+  }
+  if (provider === 'kimi-coding' || provider === 'zhipu-coding') {
+    headers.Authorization = `Bearer ${apiKey}`
+    headers['User-Agent'] = getPromaUserAgent(pkg.version)
+  } else if (provider === 'xiaomi-token-plan') {
+    headers.Authorization = `Bearer ${apiKey}`
+    headers['User-Agent'] = getPromaUserAgent(pkg.version)
+  } else if (provider === 'minimax' || provider === 'qwen-anthropic') {
+    headers.Authorization = `Bearer ${apiKey}`
+  } else {
+    headers['x-api-key'] = apiKey
+    headers.Authorization = `Bearer ${apiKey}`
+  }
 
   const response = await fetchFn(`${url}/messages`, {
     method: 'POST',
-    headers: {
-      'x-api-key': apiKey,
-      Authorization: `Bearer ${apiKey}`,
-      'anthropic-version': '2023-06-01',
-      'content-type': 'application/json',
-    },
+    headers,
     body: JSON.stringify({
-      model: 'claude-sonnet-4-5-20250929',
+      model: testModel,
       max_tokens: 1,
       messages: [{ role: 'user', content: 'hi' }],
     }),
@@ -295,7 +379,7 @@ async function testAnthropic(baseUrl: string, apiKey: string, proxyUrl?: string)
 }
 
 /**
- * 测试 OpenAI 兼容 API 连接（OpenAI / DeepSeek / Custom）
+ * 测试 OpenAI 兼容 API 连接（OpenAI / Custom）
  */
 async function testOpenAICompatible(baseUrl: string, apiKey: string, proxyUrl?: string): Promise<ChannelTestResult> {
   const url = normalizeBaseUrl(baseUrl)
@@ -357,12 +441,18 @@ export async function testChannelDirect(input: FetchModelsInput): Promise<Channe
   try {
     switch (input.provider) {
       case 'anthropic':
-        return await testAnthropic(input.baseUrl, input.apiKey, proxyUrl)
-      case 'openai':
+      case 'anthropic-compatible':
       case 'deepseek':
-      case 'moonshot':
-      case 'zhipu':
+      case 'kimi-api':
+      case 'kimi-coding':
+      case 'zhipu-coding':
       case 'minimax':
+      case 'xiaomi':
+      case 'xiaomi-token-plan':
+      case 'qwen-anthropic':
+        return await testAnthropicCompatible(input.baseUrl, input.apiKey, proxyUrl, input.provider)
+      case 'openai':
+      case 'zhipu':
       case 'doubao':
       case 'qwen':
       case 'custom':
@@ -392,12 +482,18 @@ export async function fetchModels(input: FetchModelsInput): Promise<FetchModelsR
   try {
     switch (input.provider) {
       case 'anthropic':
-        return await fetchAnthropicModels(input.baseUrl, input.apiKey, proxyUrl)
-      case 'openai':
+      case 'anthropic-compatible':
       case 'deepseek':
-      case 'moonshot':
-      case 'zhipu':
+      case 'kimi-api':
+      case 'kimi-coding':
+      case 'zhipu-coding':
       case 'minimax':
+      case 'xiaomi':
+      case 'xiaomi-token-plan':
+      case 'qwen-anthropic':
+        return await fetchAnthropicCompatibleModels(input.baseUrl, input.apiKey, proxyUrl, input.provider)
+      case 'openai':
+      case 'zhipu':
       case 'doubao':
       case 'qwen':
       case 'custom':
@@ -424,22 +520,40 @@ interface AnthropicModelItem {
 }
 
 /**
- * 从 Anthropic API 拉取模型列表
+ * 从 Anthropic 兼容 API 拉取模型列表（Anthropic / DeepSeek / Kimi API / Kimi Coding Plan / MiniMax）
  *
- * 先规范化 baseUrl 确保包含 /v1，再请求 /models。
+ * DeepSeek / Kimi 的 Anthropic API 端点无需 /v1 前缀。
+ * Kimi Coding Plan 必须发送 Proma User-Agent。
  * 文档: https://docs.anthropic.com/en/api/models-list
  */
-async function fetchAnthropicModels(baseUrl: string, apiKey: string, proxyUrl?: string): Promise<FetchModelsResult> {
-  const url = normalizeAnthropicBaseUrl(baseUrl)
+async function fetchAnthropicCompatibleModels(
+  baseUrl: string,
+  apiKey: string,
+  proxyUrl?: string,
+  provider: ProviderType = 'anthropic',
+): Promise<FetchModelsResult> {
+  const url = normalizeAnthropicProviderUrl(baseUrl, provider)
   const fetchFn = getFetchFn(proxyUrl)
+
+  const headers: Record<string, string> = {
+    'anthropic-version': '2023-06-01',
+  }
+  if (provider === 'kimi-coding' || provider === 'zhipu-coding') {
+    headers.Authorization = `Bearer ${apiKey}`
+    headers['User-Agent'] = getPromaUserAgent(pkg.version)
+  } else if (provider === 'xiaomi-token-plan') {
+    headers.Authorization = `Bearer ${apiKey}`
+    headers['User-Agent'] = getPromaUserAgent(pkg.version)
+  } else if (provider === 'minimax' || provider === 'qwen-anthropic') {
+    headers.Authorization = `Bearer ${apiKey}`
+  } else {
+    headers['x-api-key'] = apiKey
+    headers.Authorization = `Bearer ${apiKey}`
+  }
 
   const response = await fetchFn(`${url}/models`, {
     method: 'GET',
-    headers: {
-      'x-api-key': apiKey,
-      Authorization: `Bearer ${apiKey}`,
-      'anthropic-version': '2023-06-01',
-    },
+    headers,
   })
 
   if (response.status === 401) {
@@ -477,7 +591,7 @@ interface OpenAIModelItem {
 }
 
 /**
- * 从 OpenAI 兼容 API 拉取模型列表（OpenAI / DeepSeek / Custom）
+ * 从 OpenAI 兼容 API 拉取模型列表（OpenAI / Custom）
  *
  * API: GET {baseUrl}/models
  * 通用 OpenAI 兼容格式，适用于大部分第三方供应商。

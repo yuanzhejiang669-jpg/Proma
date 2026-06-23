@@ -10,14 +10,20 @@
  */
 export type ProviderType =
   | 'anthropic'
+  | 'anthropic-compatible'
   | 'openai'
   | 'deepseek'
   | 'google'
-  | 'moonshot'
+  | 'kimi-api'
+  | 'kimi-coding'
   | 'zhipu'
+  | 'zhipu-coding'
   | 'minimax'
   | 'doubao'
   | 'qwen'
+  | 'qwen-anthropic'
+  | 'xiaomi'
+  | 'xiaomi-token-plan'
   | 'custom'
 
 /**
@@ -25,14 +31,20 @@ export type ProviderType =
  */
 export const PROVIDER_DEFAULT_URLS: Record<ProviderType, string> = {
   anthropic: 'https://api.anthropic.com',
+  'anthropic-compatible': '',
   openai: 'https://api.openai.com/v1',
-  deepseek: 'https://api.deepseek.com',
+  deepseek: 'https://api.deepseek.com/anthropic',
   google: 'https://generativelanguage.googleapis.com',
-  moonshot: 'https://api.moonshot.cn/v1',
+  'kimi-api': 'https://api.moonshot.cn/anthropic',
+  'kimi-coding': 'https://api.kimi.com/coding/v1',
   zhipu: 'https://open.bigmodel.cn/api/paas/v4',
-  minimax: 'https://api.minimax.chat/v1',
+  'zhipu-coding': 'https://open.bigmodel.cn/api/anthropic',
+  minimax: 'https://api.minimaxi.com/anthropic',
   doubao: 'https://ark.cn-beijing.volces.com/api/v3',
   qwen: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+  'qwen-anthropic': 'https://dashscope.aliyuncs.com/apps/anthropic',
+  xiaomi: 'https://api.xiaomimimo.com/anthropic',
+  'xiaomi-token-plan': 'https://token-plan-cn.xiaomimimo.com/anthropic',
   custom: '',
 }
 
@@ -41,15 +53,47 @@ export const PROVIDER_DEFAULT_URLS: Record<ProviderType, string> = {
  */
 export const PROVIDER_LABELS: Record<ProviderType, string> = {
   anthropic: 'Anthropic',
+  'anthropic-compatible': 'Anthropic 兼容格式',
   openai: 'OpenAI',
   deepseek: 'DeepSeek',
   google: 'Google',
-  moonshot: 'Moonshot / Kimi',
+  'kimi-api': 'Kimi API (Anthropic 协议)',
+  'kimi-coding': 'Kimi Coding Plan',
   zhipu: '智谱 AI',
-  minimax: 'MiniMax',
+  'zhipu-coding': '智谱 Coding Plan',
+  minimax: 'MiniMax (API&编程包)',
   doubao: '豆包',
   qwen: '通义千问',
+  'qwen-anthropic': '通义千问 (Anthropic 协议)',
+  xiaomi: '小米 MiMo (API)',
+  'xiaomi-token-plan': '小米 MiMo Token Plan',
   custom: 'OpenAI 兼容格式',
+}
+
+/**
+ * 支持 Agent 模式的供应商类型
+ *
+ * Agent SDK 通过 Anthropic 兼容协议调用 `/v1/messages` 端点，
+ * 因此所有 Anthropic 协议兼容的供应商都可以用于 Agent。
+ */
+export const AGENT_COMPATIBLE_PROVIDERS: ReadonlySet<ProviderType> = new Set<ProviderType>([
+  'anthropic',
+  'anthropic-compatible',
+  'deepseek',
+  'kimi-api',
+  'kimi-coding',
+  'zhipu-coding',
+  'minimax',
+  'xiaomi',
+  'xiaomi-token-plan',
+  'qwen-anthropic',
+])
+
+/**
+ * 判断供应商是否兼容 Agent 模式
+ */
+export function isAgentCompatibleProvider(provider: ProviderType): boolean {
+  return AGENT_COMPATIBLE_PROVIDERS.has(provider)
 }
 
 /**
@@ -62,6 +106,8 @@ export interface ChannelModel {
   name: string
   /** 是否启用 */
   enabled: boolean
+  /** 来源标记：手动添加的模型在拉取供应商列表时保留，不会被覆盖清除 */
+  source?: 'manual' | 'fetched'
 }
 
 /**

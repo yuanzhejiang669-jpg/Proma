@@ -22,23 +22,34 @@ const registeredAccelerators = new Map<string, string>()
 const GLOBAL_SHORTCUT_DEFAULTS: Record<string, { mac: string; win: string }> = {
   'quick-task': { mac: 'Alt+Space', win: 'Alt+Space' },
   'show-main-window': { mac: 'CommandOrControl+Shift+P', win: 'CommandOrControl+Shift+P' },
+  'voice-dictation': { mac: 'Ctrl+`', win: 'Ctrl+`' },
 }
 
 const isMac = process.platform === 'darwin'
+const VOICE_DICTATION_SHORTCUT_ID = 'voice-dictation'
+
+function shouldRegisterGlobalShortcut(id: string): boolean {
+  if (id !== VOICE_DICTATION_SHORTCUT_ID) return true
+  return getSettings().voiceDictation?.enabled === true
+}
 
 /**
  * 获取某全局快捷键当前生效的 Electron accelerator 字符串
  *
- * 优先使用用户自定义，否则使用默认值。
- * 将 Cmd/Ctrl 统一转为 Electron 的 CommandOrControl。
+ * 返回值：
+ * - 非空字符串：当前生效的 accelerator（用户自定义或默认值）
+ * - `null`：用户已主动禁用此快捷键，跳过 globalShortcut.register
+ *
+ * 将 Cmd 统一转为 Electron 的 CommandOrControl；Ctrl 保持为物理 Control 键。
  */
-function getGlobalAccelerator(id: string): string {
+function getGlobalAccelerator(id: string): string | null {
   const settings = getSettings()
   const override = settings.shortcutOverrides?.[id]
 
   let accelerator: string
   if (override) {
     const customAccel = isMac ? override.mac : override.win
+    if (customAccel === null) return null
     if (customAccel) {
       accelerator = customAccel
     } else {
@@ -52,8 +63,9 @@ function getGlobalAccelerator(id: string): string {
 
   // 转换为 Electron 标准格式
   return accelerator
-    .replace(/Cmd\+/gi, 'CommandOrControl+')
-    .replace(/Ctrl\+/gi, 'CommandOrControl+')
+    .split('+')
+    .map((part) => part.trim().toLowerCase() === 'cmd' ? 'CommandOrControl' : part)
+    .join('+')
 }
 
 /**
@@ -65,7 +77,16 @@ function registerOne(id: string): boolean {
   const callback = globalCallbacks.get(id)
   if (!callback) return false
 
+  if (!shouldRegisterGlobalShortcut(id)) {
+    console.log(`[全局快捷键] 跳过注册: ${id} 未启用`)
+    return false
+  }
+
   const accelerator = getGlobalAccelerator(id)
+  if (accelerator === null) {
+    console.log(`[全局快捷键] 跳过注册: ${id} 已被用户禁用`)
+    return false
+  }
   if (!accelerator) return false
 
   try {

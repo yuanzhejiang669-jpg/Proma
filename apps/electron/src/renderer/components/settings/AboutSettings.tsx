@@ -7,7 +7,7 @@
 
 import * as React from 'react'
 import { useAtomValue, useSetAtom } from 'jotai'
-import { RefreshCw, Loader2, CheckCircle2, AlertCircle, Info, Terminal, ChevronDown, ChevronUp, ExternalLink } from 'lucide-react'
+import { RefreshCw, Loader2, CheckCircle2, AlertCircle, Info, Terminal, ChevronDown, ChevronUp, ExternalLink, RotateCw } from 'lucide-react'
 import type { EnvironmentCheckResult, RuntimeStatus } from '@proma/shared'
 import {
   SettingsSection,
@@ -57,6 +57,10 @@ function UpdateCard(): React.ReactElement | null {
     window.electronAPI.openExternal(url)
   }
 
+  const handleQuitAndInstall = (): void => {
+    window.electronAPI.updater?.quitAndInstall()
+  }
+
   // 当检测到新版本时，获取完整的 release 信息
   React.useEffect(() => {
     if (status.status === 'available' && status.version && !release) {
@@ -74,7 +78,7 @@ function UpdateCard(): React.ReactElement | null {
     }
   }, [status.status, status.version, release])
 
-  const isChecking = checking || status.status === 'checking'
+  const isChecking = checking || status.status === 'checking' || status.status === 'downloading'
   const hasReleaseNotes = status.releaseNotes || release?.body
 
   return (
@@ -85,7 +89,15 @@ function UpdateCard(): React.ReactElement | null {
           <StatusText status={status.status} version={status.version} error={status.error} />
 
           {/* 操作按钮 */}
-          {status.status === 'available' ? (
+          {status.status === 'downloaded' ? (
+            <button
+              onClick={handleQuitAndInstall}
+              className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90 transition-colors"
+            >
+              <RotateCw className="h-3.5 w-3.5" />
+              立即重启
+            </button>
+          ) : status.status === 'available' ? (
             <button
               onClick={handleGoToDownload}
               className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90 transition-colors"
@@ -154,6 +166,20 @@ function StatusText({ status, version, error }: {
         <span className="text-xs text-primary flex items-center gap-1">
           <ExternalLink className="h-3 w-3" />
           新版本 v{version} 可用
+        </span>
+      )
+    case 'downloading':
+      return (
+        <span className="text-xs text-muted-foreground flex items-center gap-1">
+          <Loader2 className="h-3 w-3 animate-spin" />
+          正在下载 v{version}
+        </span>
+      )
+    case 'downloaded':
+      return (
+        <span className="text-xs text-primary flex items-center gap-1">
+          <CheckCircle2 className="h-3 w-3" />
+          更新 v{version} 已就绪
         </span>
       )
     case 'not-available':
@@ -255,7 +281,10 @@ function EnvironmentCard(): React.ReactElement {
           status={nodejsStatus}
           version={result?.nodejs.version}
           requirement="推荐 22 LTS，最低 18 LTS"
-          downloadUrl={result?.nodejs.downloadUrl || 'https://nodejs.org/'}
+          action={{
+            type: 'openExternal',
+            url: result?.nodejs.downloadUrl || 'https://nodejs.org/',
+          }}
           statusText={
             result && nodejsStatus === 'warning'
               ? `v${result.nodejs.version} (建议升级到 22 LTS 以获得最佳体验)`
@@ -269,7 +298,10 @@ function EnvironmentCard(): React.ReactElement {
           status={gitStatus}
           version={result?.git.version}
           requirement="版本 >= 2.0"
-          downloadUrl={result?.git.downloadUrl || 'https://git-scm.com/'}
+          action={{
+            type: 'openExternal',
+            url: result?.git.downloadUrl || 'https://git-scm.com/',
+          }}
         />
 
         {/* Windows 提示 */}
@@ -355,7 +387,7 @@ function ShellEnvironmentCard(): React.ReactElement | null {
           status={shell.gitBash?.available ? 'success' : 'error'}
           version={shell.gitBash?.version ?? undefined}
           requirement="Git for Windows 自带"
-          downloadUrl="https://git-scm.com/download/win"
+          action={{ type: 'download', installerId: 'git-for-windows' }}
           statusText={
             shell.gitBash?.available
               ? `${shell.gitBash.path}`
@@ -369,7 +401,10 @@ function ShellEnvironmentCard(): React.ReactElement | null {
           status={shell.wsl?.available ? 'success' : 'error'}
           version={shell.wsl?.version ? `WSL ${shell.wsl.version}` : undefined}
           requirement="WSL 1 或 WSL 2"
-          downloadUrl="https://learn.microsoft.com/zh-cn/windows/wsl/install"
+          action={{
+            type: 'openExternal',
+            url: 'https://learn.microsoft.com/zh-cn/windows/wsl/install',
+          }}
           statusText={
             shell.wsl?.available
               ? `默认发行版: ${shell.wsl.defaultDistro || '未设置'} (${shell.wsl.distros.join(', ')})`
@@ -419,9 +454,16 @@ export function AboutSettings(): React.ReactElement {
         </SettingsRow>
         <SettingsRow
           label="开源协议"
-          description="本项目遵循开源协议发布"
+          description="社区版基于 AGPL-3.0 开源，商业授权请联系 erlichliu@gmail.com"
         >
-          <span className="text-sm text-muted-foreground">MIT</span>
+          <a
+            href="https://www.gnu.org/licenses/agpl-3.0.html"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="text-sm text-primary hover:underline"
+          >
+            AGPL-3.0
+          </a>
         </SettingsRow>
         <SettingsRow label="项目地址">
           <a

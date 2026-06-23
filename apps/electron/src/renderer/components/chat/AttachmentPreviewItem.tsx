@@ -21,6 +21,10 @@ interface AttachmentPreviewItemProps {
   previewUrl?: string
   /** 删除回调 */
   onRemove: () => void
+  /** 点击回调（用于打开文件预览等） */
+  onClick?: () => void
+  /** 编辑完成回调 — 提供则启用图片编辑功能 */
+  onEditComplete?: (editedDataUrl: string) => void
   className?: string
 }
 
@@ -39,9 +43,18 @@ export function AttachmentPreviewItem({
   mediaType,
   previewUrl,
   onRemove,
+  onClick,
+  onEditComplete,
   className,
 }: AttachmentPreviewItemProps): React.ReactElement {
   const [lightboxOpen, setLightboxOpen] = React.useState(false)
+  const handleRemoveClick = React.useCallback((event: React.MouseEvent<HTMLButtonElement>) => {
+    event.stopPropagation()
+    onRemove()
+  }, [onRemove])
+  const handleRemoveKeyDown = React.useCallback((event: React.KeyboardEvent<HTMLButtonElement>) => {
+    event.stopPropagation()
+  }, [])
 
   if (isImage(mediaType) && previewUrl) {
     // 图片预览 — 紧凑缩略图，点击可预览大图
@@ -57,11 +70,13 @@ export function AttachmentPreviewItem({
           alt={filename}
           className="size-full object-cover cursor-pointer"
           onClick={() => setLightboxOpen(true)}
+          onError={(e) => { (e.target as HTMLImageElement).style.display = 'none' }}
         />
         {/* hover 关闭按钮 */}
         <button
           type="button"
-          onClick={onRemove}
+          onClick={handleRemoveClick}
+          onKeyDown={handleRemoveKeyDown}
           className={cn(
             'absolute top-1 right-1 size-[18px] rounded-full',
             'bg-black/50 text-white backdrop-blur-sm',
@@ -77,6 +92,7 @@ export function AttachmentPreviewItem({
           alt={filename}
           open={lightboxOpen}
           onOpenChange={setLightboxOpen}
+          onEditComplete={onEditComplete}
         />
       </div>
     )
@@ -90,15 +106,26 @@ export function AttachmentPreviewItem({
         'rounded-lg bg-[#37a5aa]/10 border border-[#37a5aa]/20',
         'pl-2.5 pr-7 py-1.5 text-[13px] text-[#37a5aa]',
         'transition-colors hover:bg-[#37a5aa]/15',
+        onClick && 'cursor-pointer',
         className
       )}
+      onClick={onClick}
+      role={onClick ? 'button' : undefined}
+      tabIndex={onClick ? 0 : undefined}
+      onKeyDown={onClick ? (e: React.KeyboardEvent) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault()
+          onClick()
+        }
+      } : undefined}
     >
       <Paperclip className="size-4 shrink-0" />
       <span className="max-w-[160px] truncate">{truncateName(filename)}</span>
       {/* 关闭按钮 */}
       <button
         type="button"
-        onClick={onRemove}
+        onClick={handleRemoveClick}
+        onKeyDown={handleRemoveKeyDown}
         className={cn(
           'absolute top-1/2 right-1.5 -translate-y-1/2 size-[18px] rounded-full',
           'flex items-center justify-center',

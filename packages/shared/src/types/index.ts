@@ -30,6 +30,9 @@ export * from './agent-provider'
 // 环境检测相关类型
 export * from './environment'
 
+// 第三方安装包（Git、Node.js 等）相关类型
+export * from './installer'
+
 // GitHub Release 相关类型
 export * from './github'
 
@@ -47,3 +50,6 @@ export * from './dingtalk'
 
 // 微信集成相关类型
 export * from './wechat'
+
+// 定时任务（Automation）相关类型
+export * from './automation'

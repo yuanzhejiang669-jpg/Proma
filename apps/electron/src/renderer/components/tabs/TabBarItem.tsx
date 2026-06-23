@@ -1,7 +1,7 @@
 /**
  * TabBarItem — 单个标签页 UI
  *
- * 显示：类型图标 + 标题 + 流式指示器 + 关闭按钮
+ * 显示：标题 + 工作区标签 + 流式指示器 + 关闭按钮
  * 支持：点击聚焦、中键关闭、拖拽重排
  * hover 预览面板由父级 TabBar 统一管理状态
  */
@@ -9,27 +9,35 @@
 import * as React from 'react'
 import { createPortal } from 'react-dom'
 import { useAtomValue } from 'jotai'
-import { MessageSquare, Bot, X } from 'lucide-react'
+import { FileText, StickyNote, X, Clock, GitBranch } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import type { TabType, TabMinimapItem } from '@/atoms/tab-atoms'
 import type { SessionIndicatorStatus } from '@/atoms/agent-atoms'
 import { tabMinimapCacheAtom } from '@/atoms/tab-atoms'
+import { interfaceVariantAtom } from '@/atoms/theme'
 import { TabPreviewPanel } from './TabPreviewPanel'
 
 export interface TabBarItemProps {
   id: string
   type: TabType
   title: string
+  workspaceName?: string
   isActive: boolean
   isStreaming: SessionIndicatorStatus
   /** 是否显示 hover 预览面板（由父级管理） */
   isHovered: boolean
   /** 预览面板是否正在退出动画 */
   isLeaving: boolean
+  /** 该 Tab 正在被拖出 TabBar 转分屏（tear-off 触发瞬间） */
+  isTearingOff?: boolean
   onActivate: () => void
   onClose: () => void
   onMiddleClick: () => void
   onDragStart: (e: React.PointerEvent) => void
+  /** 该 Tab 对应的会话是否由定时任务创建 */
+  isAutomation?: boolean
+  /** 该 Tab 对应的会话是否由父 Agent 协作委派创建 */
+  isDelegation?: boolean
   /** hover 进入 Tab */
   onHoverEnter: () => void
   /** hover 离开 Tab */
@@ -44,14 +52,18 @@ export function TabBarItem({
   id,
   type,
   title,
+  workspaceName,
   isActive,
   isStreaming,
   isHovered,
   isLeaving,
+  isTearingOff,
   onActivate,
   onClose,
   onMiddleClick,
   onDragStart,
+  isAutomation,
+  isDelegation,
   onHoverEnter,
   onHoverLeave,
   onPanelHoverEnter,
@@ -60,6 +72,8 @@ export function TabBarItem({
   const buttonRef = React.useRef<HTMLButtonElement>(null)
   const [isNarrow, setIsNarrow] = React.useState(false)
   const minimapCache = useAtomValue(tabMinimapCacheAtom)
+  const interfaceVariant = useAtomValue(interfaceVariantAtom)
+  const isClassic = interfaceVariant === 'classic'
 
   React.useEffect(() => {
     const el = buttonRef.current
@@ -73,6 +87,8 @@ export function TabBarItem({
   }, [])
 
   const handleMouseDown = (e: React.MouseEvent): void => {
+    // Scratch Pad 不可中键关闭
+    if (type === 'scratch') return
     if (e.button === 1) {
       e.preventDefault()
       onMiddleClick()
@@ -84,24 +100,58 @@ export function TabBarItem({
     onClose()
   }
 
-  const Icon = type === 'chat' ? MessageSquare : Bot
-  const indicatorColor = isStreaming !== 'idle'
+  const isScratch = type === 'scratch'
+  const indicatorColor = isScratch
+    ? undefined
+    : isStreaming !== 'idle'
     ? isStreaming === 'completed'
-      ? 'bg-green-500'
+      ? 'border-green-500'
       : isStreaming === 'blocked'
-        ? 'bg-orange-500'
-        : type === 'chat'
-          ? 'bg-emerald-500'
-          : 'bg-blue-500'
+        ? 'border-orange-500'
+        : 'border-blue-500'
     : undefined
-  const indicatorPulse = isStreaming === 'running' || isStreaming === 'blocked'
   const previewItems = minimapCache.get(id) ?? []
   // 当前 active Tab 不显示预览面板
   const showPreview = isHovered && !isActive
 
+  // Scratch Pad 是固定草稿入口
+  if (isScratch) {
+    return (
+      <div
+        className="relative flex-shrink-0 titlebar-no-drag"
+        onMouseEnter={onHoverEnter}
+        onMouseLeave={onHoverLeave}
+      >
+        <button
+          ref={buttonRef}
+          type="button"
+          className={cn(
+            'group relative flex items-center justify-center gap-1.5 min-w-[82px] px-3 h-[34px]',
+            isClassic ? 'rounded-t-lg' : 'rounded-none',
+            'text-xs transition-colors select-none cursor-pointer',
+            'border-t border-l border-r border-transparent',
+            isActive
+              ? isClassic
+                ? 'bg-content-area text-foreground border-border/50'
+                : 'app-tab-active text-foreground border-border/80'
+              : isClassic
+                ? 'text-muted-foreground hover:text-foreground hover:bg-muted/50'
+                : 'app-tab-inactive text-muted-foreground hover:text-foreground',
+          )}
+          onClick={onActivate}
+          onMouseDown={handleMouseDown}
+          onPointerDown={onDragStart}
+        >
+          <StickyNote className="size-3.5" />
+          <span className="truncate">草稿</span>
+        </button>
+      </div>
+    )
+  }
+
   return (
     <div
-      className="relative flex-1 min-w-[48px] max-w-[200px]"
+      className="relative min-w-[120px] max-w-[200px] flex-[1_0_120px] titlebar-no-drag"
       onMouseEnter={onHoverEnter}
       onMouseLeave={onHoverLeave}
     >
@@ -110,27 +160,45 @@ export function TabBarItem({
         type="button"
         className={cn(
           'group relative flex items-center gap-1.5 px-3 h-[34px] w-full',
-          'rounded-t-lg text-xs transition-colors select-none cursor-pointer',
+          isClassic ? 'rounded-t-lg' : 'rounded-none',
+          'text-xs transition-colors select-none cursor-pointer',
           'border-t border-l border-r border-transparent',
           isActive
-            ? 'bg-content-area text-foreground border-border/50'
-            : 'text-muted-foreground hover:text-foreground hover:bg-muted/50',
+            ? isClassic
+              ? 'bg-content-area text-foreground border-border/50'
+              : 'app-tab-active text-foreground border-border/80'
+            : isClassic
+              ? 'text-muted-foreground hover:text-foreground hover:bg-muted/50'
+              : 'app-tab-inactive text-muted-foreground hover:text-foreground',
+          isTearingOff && 'ring-2 ring-primary/70 ring-offset-0 bg-primary/10',
         )}
         onClick={onActivate}
         onMouseDown={handleMouseDown}
         onPointerDown={onDragStart}
       >
-        {/* 类型图标 */}
-        <Icon className={cn('shrink-0', isNarrow ? 'size-3.5' : 'size-3')} />
+        {type === 'preview' && !isNarrow && (
+          <FileText className="size-3.5 shrink-0 text-muted-foreground" />
+        )}
 
         {/* 标题（窄状态下隐藏，用 spacer 撑开让关闭按钮靠右） */}
         {isNarrow ? (
           <span className="flex-1" />
         ) : (
-          <span className="flex-1 min-w-0 truncate text-left">{title}</span>
+          <span className="flex-1 min-w-0 truncate text-left flex items-center gap-1">
+            {isAutomation && <Clock className="size-3 shrink-0 text-foreground/40" />}
+            {isDelegation && !isAutomation && <GitBranch className="size-3 shrink-0 text-foreground/40" />}
+            {title}
+          </span>
         )}
 
-        {/* 关闭按钮 */}
+        {workspaceName && !isNarrow && (
+          <span className="shrink-0 px-1.5 py-0 rounded-full bg-primary/10 text-[10px] leading-4 workspace-badge font-medium truncate max-w-[86px]">
+            {workspaceName}
+          </span>
+        )}
+
+        {/* 关闭按钮（scratch 类型不显示） */}
+        {!isScratch && (
         <span
           role="button"
           tabIndex={-1}
@@ -146,14 +214,15 @@ export function TabBarItem({
         >
           <X className="size-2.5" />
         </span>
+        )}
 
-        {/* 底部状态横线条 */}
+        {/* 状态包边 */}
         {indicatorColor && (
           <span
             className={cn(
-              'absolute left-2 right-2 bottom-0 h-[2px] rounded-full pointer-events-none',
+              'absolute inset-0 border-t-2 border-l-2 border-r-2 border-b-0 pointer-events-none tab-stream-indicator',
+              isClassic ? 'rounded-t-lg' : 'rounded-none',
               indicatorColor,
-              indicatorPulse && 'animate-pulse',
             )}
             aria-hidden="true"
           />

@@ -1,13 +1,15 @@
 import * as React from 'react'
-import { useSetAtom } from 'jotai'
-import { useStore } from 'jotai'
+import { useAtom, useStore } from 'jotai'
 import { AppShell } from './components/app-shell/AppShell'
 import { OnboardingView } from './components/onboarding/OnboardingView'
 import { TutorialBanner } from './components/tutorial/TutorialBanner'
+import { EnvironmentCheckDialog } from './components/environment/EnvironmentCheckDialog'
+import { MigrationImportDialog } from './components/migration/MigrationImportDialog'
 import { TooltipProvider } from './components/ui/tooltip'
-import { environmentCheckResultAtom } from './atoms/environment'
+import { SettingsDialog } from './components/settings/SettingsDialog'
 import { conversationsAtom } from './atoms/chat-atoms'
-import { tabsAtom, activeTabIdAtom, openTab } from './atoms/tab-atoms'
+import { environmentCheckDialogOpenAtom } from './atoms/environment'
+import { tabsAtom, activeTabIdAtom, openTab, TUTORIAL_TAB_ID } from './atoms/tab-atoms'
 import type { AppShellContextType } from './contexts/AppShellContext'
 
 export default function App(): React.ReactElement {
@@ -18,23 +20,17 @@ export default function App(): React.ReactElement {
     console.warn(`[FLASH-DEBUG] App re-render #${appRenderCountRef.current}, isLoading/showOnboarding may have changed`)
   }
 
-  const setEnvironmentResult = useSetAtom(environmentCheckResultAtom)
   const store = useStore()
   const [isLoading, setIsLoading] = React.useState(true)
   const [showOnboarding, setShowOnboarding] = React.useState(false)
 
-  // 初始化：检查 onboarding 状态和环境
+  // 初始化：检查是否需要显示 Onboarding
+  // macOS/Linux 上 SDK 自带 claude native binary 不依赖宿主 Node/Git；
+  // Windows 上仍需 Git Bash/WSL，由 Onboarding Step 2 与聊天错误卡片引导用户安装。
   React.useEffect(() => {
     const initialize = async () => {
       try {
-        // 1. 获取设置，检查是否需要 onboarding
         const settings = await window.electronAPI.getSettings()
-
-        // 2. 执行环境检测（无论是否完成 onboarding）
-        const envResult = await window.electronAPI.checkEnvironment()
-        setEnvironmentResult(envResult)
-
-        // 3. 判断是否显示 onboarding
         if (!settings.onboardingCompleted) {
           setShowOnboarding(true)
         }
@@ -46,20 +42,26 @@ export default function App(): React.ReactElement {
     }
 
     initialize()
-  }, [setEnvironmentResult])
+  }, [])
 
-  // 完成 onboarding 回调：创建欢迎对话
-  const handleOnboardingComplete = async () => {
+  // 完成 onboarding 回调：创建欢迎对话，可选打开教程 Tab
+  const handleOnboardingComplete = async (openTutorial?: boolean) => {
     setShowOnboarding(false)
+
+    if (openTutorial) {
+      const tabs = store.get(tabsAtom)
+      const result = openTab(tabs, { type: 'tutorial', sessionId: TUTORIAL_TAB_ID, title: 'Proma 使用教程' })
+      store.set(tabsAtom, result.tabs)
+      store.set(activeTabIdAtom, result.activeTabId)
+      return
+    }
 
     try {
       const meta = await window.electronAPI.createWelcomeConversation()
       if (meta) {
-        // 添加到对话列表
         const conversations = store.get(conversationsAtom)
         store.set(conversationsAtom, [meta, ...conversations])
 
-        // 打开对话标签页
         const tabs = store.get(tabsAtom)
         const result = openTab(tabs, {
           type: 'chat',
@@ -91,6 +93,7 @@ export default function App(): React.ReactElement {
     return (
       <TooltipProvider delayDuration={200}>
         <OnboardingView onComplete={handleOnboardingComplete} />
+        <MigrationImportDialog />
       </TooltipProvider>
     )
   }
@@ -102,7 +105,18 @@ export default function App(): React.ReactElement {
   return (
     <TooltipProvider delayDuration={200}>
       <AppShell contextValue={contextValue} />
+      <SettingsDialog />
       <TutorialBanner />
+      <GlobalEnvironmentCheckDialog />
+      <MigrationImportDialog />
     </TooltipProvider>
   )
+}
+
+/**
+ * 全局环境检测 Dialog，由错误卡片的 recovery action 按钮打开。
+ */
+function GlobalEnvironmentCheckDialog(): React.ReactElement {
+  const [open, setOpen] = useAtom(environmentCheckDialogOpenAtom)
+  return <EnvironmentCheckDialog open={open} onOpenChange={setOpen} />
 }

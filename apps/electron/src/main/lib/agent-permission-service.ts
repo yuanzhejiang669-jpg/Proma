@@ -52,17 +52,22 @@ export type PermissionUpdate = {
   destination: PermissionUpdateDestination
 }
 
-/** SDK PermissionResult（匹配 SDK 0.2.63） */
+/** SDK PermissionDecisionClassification（匹配 SDK 0.2.120） */
+type PermissionDecisionClassification = 'user_temporary' | 'user_permanent' | 'user_reject'
+
+/** SDK PermissionResult（匹配 SDK 0.2.120） */
 export type PermissionResult = {
   behavior: 'allow'
   updatedInput?: Record<string, unknown>
   updatedPermissions?: PermissionUpdate[]
   toolUseID?: string
+  decisionClassification?: PermissionDecisionClassification
 } | {
   behavior: 'deny'
   message: string
   interrupt?: boolean
   toolUseID?: string
+  decisionClassification?: PermissionDecisionClassification
 }
 
 /** canUseTool 回调的 options 参数（匹配 SDK CanUseTool） */
@@ -71,8 +76,13 @@ export interface CanUseToolOptions {
   suggestions?: PermissionUpdate[]
   blockedPath?: string
   decisionReason?: string
+  decisionReasonType?: string
+  classifierApprovable?: boolean
   toolUseID: string
   agentID?: string
+  title?: string
+  displayName?: string
+  description?: string
 }
 
 /** 待处理的权限请求 */
@@ -102,10 +112,10 @@ export class AgentPermissionService {
   private sessionWhitelists = new Map<string, SessionWhitelist>()
 
   /**
-   * 创建 canUseTool 回调（仅 acceptEdits 模式使用）
+   * 创建 canUseTool 回调（auto 模式及 escalation 场景使用）
    *
-   * SDK 的 acceptEdits 模式自动处理文件编辑允许，仅在 SDK 认为需要确认时调用此回调。
-   * 返回的函数签名匹配 SDK 的 CanUseTool 类型。
+   * SDK 的 auto 模式内置 classifier 自动处理大多数权限决策，仅在 classifier 无法判断时
+   * 才调用此回调（escalation）。返回的函数签名匹配 SDK 的 CanUseTool 类型。
    */
   createCanUseTool(
     sessionId: string,
@@ -128,6 +138,11 @@ export class AgentPermissionService {
 
       // 会话白名单检查（用户之前选择了"始终允许"）
       if (this.isWhitelisted(sessionId, toolName, input)) return allow()
+
+      // auto 模式本地 classifier：只读工具（Read/Glob/Grep/WebSearch/WebFetch 及只读 Bash 命令）自动放行
+      // 原因：CLI 的 --permission-prompt-tool stdio 会把每次 tool 调用都转发给 canUseTool，
+      // SDK 的 auto classifier 对只读操作未必真的放行，这里做本地兜底避免用户被无意义的审批打扰
+      if (this.isReadOnlyTool(toolName, input)) return allow()
 
       // 需要询问用户：构建请求并发送到 UI
       const request = this.buildPermissionRequest(sessionId, toolName, input, options)
@@ -304,6 +319,11 @@ export class AgentPermissionService {
       command,
       dangerLevel: this.assessDangerLevel(toolName, input),
       decisionReason: options.decisionReason,
+      decisionReasonType: options.decisionReasonType,
+      classifierApprovable: options.classifierApprovable,
+      sdkDisplayName: options.displayName,
+      sdkTitle: options.title,
+      sdkDescription: options.description,
     }
   }
 
@@ -332,6 +352,26 @@ export class AgentPermissionService {
         return typeof input.description === 'string'
           ? `启动子任务: ${input.description}`
           : '启动子任务'
+      case 'REPL':
+        return typeof input.description === 'string'
+          ? `执行 REPL: ${input.description}`
+          : '执行 REPL 代码'
+      case 'Workflow':
+        return typeof input.name === 'string'
+          ? `运行工作流: ${input.name}`
+          : '运行工作流'
+      case 'ScheduleWakeup':
+        return typeof input.reason === 'string'
+          ? `安排会话唤醒: ${input.reason}`
+          : '安排会话唤醒'
+      case 'Monitor':
+        return typeof input.description === 'string'
+          ? `启动监控任务: ${input.description}`
+          : '启动监控任务'
+      case 'PushNotification':
+        return typeof input.message === 'string'
+          ? `发送通知: ${input.message}`
+          : '发送通知'
       default:
         return `使用工具: ${toolName}`
     }
@@ -353,6 +393,11 @@ export class AgentPermissionService {
 
     // Task 工具默认为 normal
     if (toolName === 'Task') return 'normal'
+
+    // 新 SDK 的后台/定时/通知/脚本能力都可能产生会话外影响，需要明确审批
+    if (['REPL', 'Workflow', 'ScheduleWakeup', 'Monitor', 'PushNotification', 'CronCreate', 'CronDelete', 'RemoteTrigger'].includes(toolName)) {
+      return 'normal'
+    }
 
     return 'normal'
   }

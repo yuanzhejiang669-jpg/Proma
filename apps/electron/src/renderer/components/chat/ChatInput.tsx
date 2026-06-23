@@ -22,12 +22,14 @@ import { ToolSelectorPopover } from './ToolSelectorPopover'
 import { AttachmentPreviewItem } from './AttachmentPreviewItem'
 import { RichTextInput } from '@/components/ai-elements/rich-text-input'
 import { SpeechButton } from '@/components/ai-elements/speech-button'
+import { InputToolbarOverflow, type ToolbarItem } from '@/components/ai-elements/InputToolbarOverflow'
 import { Button } from '@/components/ui/button'
 import {
   Tooltip,
   TooltipContent,
   TooltipTrigger,
 } from '@/components/ui/tooltip'
+import { getActiveAccelerator, getAcceleratorDisplay } from '@/lib/shortcut-registry'
 import {
   conversationDraftsAtom,
 } from '@/atoms/chat-atoms'
@@ -36,10 +38,11 @@ import {
   useConversationModel,
   useConversationThinkingEnabled,
 } from '@/hooks/useConversationSettings'
-import { FeishuNotifyToggle } from './FeishuNotifyToggle'
 import { cn } from '@/lib/utils'
-import { fileToBase64 } from '@/lib/file-utils'
+import { fileToBase64, formatFileNames } from '@/lib/file-utils'
+import { MAX_ATTACHMENT_SIZE } from '@proma/shared'
 import { sendWithCmdEnterAtom } from '@/atoms/shortcut-atoms'
+import { toast } from 'sonner'
 
 interface ChatInputProps {
   /** 当前对话 ID */
@@ -91,7 +94,22 @@ export function ChatInput({ conversationId, streaming, pendingAttachments, onSet
    * File → base64 → saveAttachment IPC → 创建 blob URL → 添加到 atom
    */
   const addFilesAsAttachments = React.useCallback(async (files: File[]): Promise<void> => {
+    const oversized: string[] = []
+    const okFiles: File[] = []
+
     for (const file of files) {
+      if (file.size > MAX_ATTACHMENT_SIZE) {
+        oversized.push(file.name)
+      } else {
+        okFiles.push(file)
+      }
+    }
+
+    if (oversized.length > 0) {
+      toast.error(`以下文件超过 100MB，Chat 附件暂不支持，已跳过：${formatFileNames(oversized)}`)
+    }
+
+    for (const file of okFiles) {
       try {
         const base64 = await fileToBase64(file)
 
@@ -127,9 +145,24 @@ export function ChatInput({ conversationId, streaming, pendingAttachments, onSet
   const handleOpenFileDialog = React.useCallback(async (): Promise<void> => {
     try {
       const result = await window.electronAPI.openFileDialog()
-      if (result.files.length === 0) return
+      const largeFiles = result.largeFiles ?? []
+      const skippedFiles = result.skippedFiles ?? []
+      if (result.files.length === 0 && largeFiles.length === 0 && skippedFiles.length === 0) return
+
+      if (largeFiles.length > 0) {
+        toast.error(`以下文件超过 100MB，Chat 附件暂不支持，已跳过：${formatFileNames(largeFiles.map((f) => f.filename))}`)
+      }
+      if (skippedFiles.length > 0) {
+        toast.warning(`以下文件无法读取，已跳过：${formatFileNames(skippedFiles.map((f) => f.filename))}`)
+      }
+
+      const oversized: string[] = []
 
       for (const fileInfo of result.files) {
+        if (fileInfo.size > MAX_ATTACHMENT_SIZE) {
+          oversized.push(fileInfo.filename)
+          continue
+        }
         const previewUrl = fileInfo.mediaType.startsWith('image/')
           ? `data:${fileInfo.mediaType};base64,${fileInfo.data}`
           : undefined
@@ -150,6 +183,10 @@ export function ChatInput({ conversationId, streaming, pendingAttachments, onSet
 
         setPendingAttachments((prev) => [...prev, pendingAttachment])
       }
+
+      if (oversized.length > 0) {
+        toast.error(`以下文件超过 100MB，Chat 附件暂不支持，已跳过：${formatFileNames(oversized)}`)
+      }
     } catch (error) {
       console.error('[ChatInput] 文件选择对话框失败:', error)
     }
@@ -169,6 +206,33 @@ export function ChatInput({ conversationId, streaming, pendingAttachments, onSet
     })
   }, [setPendingAttachments])
 
+  /** 编辑完成 — 用编辑后的图片替换原 pending 附件 */
+  const handleEditComplete = React.useCallback((attachmentId: string, editedDataUrl: string): void => {
+    const base64 = editedDataUrl.split(',')[1]
+    if (!base64) return
+
+    if (!window.__pendingAttachmentData) {
+      window.__pendingAttachmentData = new Map()
+    }
+    window.__pendingAttachmentData.set(attachmentId, base64)
+
+    setPendingAttachments((prev) =>
+      prev.map((att) => {
+        if (att.id !== attachmentId) return att
+        if (att.previewUrl?.startsWith('blob:')) {
+          URL.revokeObjectURL(att.previewUrl)
+        }
+        return {
+          ...att,
+          previewUrl: editedDataUrl,
+          filename: att.filename.replace(/(\.[^.]+)?$/, '') + '_edited.png',
+          mediaType: 'image/png',
+          size: Math.round(base64.length * 0.75),
+        }
+      })
+    )
+  }, [setPendingAttachments])
+
   /** 发送消息 */
   const handleSend = React.useCallback((): void => {
     if (!canSend) return
@@ -176,11 +240,6 @@ export function ChatInput({ conversationId, streaming, pendingAttachments, onSet
     setContent('')
     // 附件清理由 ChatView 的 handleSend 负责
   }, [canSend, content, onSend])
-
-  /** 语音识别结果 */
-  const handleSpeechTranscript = React.useCallback((text: string): void => {
-    setContent(content + (content ? ' ' : '') + text)
-  }, [content, setContent])
 
   /** 粘贴文件回调 */
   const handlePasteFiles = React.useCallback((files: File[]): void => {
@@ -231,6 +290,94 @@ export function ChatInput({ conversationId, streaming, pendingAttachments, onSet
     return () => window.removeEventListener('proma:focus-input', handler)
   }, [])
 
+  const toolbarItems = React.useMemo<ToolbarItem[]>(() => [
+    { key: 'model', node: <ModelSelector /> },
+    {
+      key: 'thinking',
+      node: (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              className={cn(
+                'size-[36px] shrink-0 rounded-full',
+                thinkingEnabled ? 'text-green-500' : 'text-foreground/60 hover:text-foreground'
+              )}
+              onClick={() => setThinkingEnabled(!thinkingEnabled)}
+            >
+              <Brain className="size-5" />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent side="top">
+            <p>{thinkingEnabled ? '关闭思考模式' : '开启思考模式'}</p>
+          </TooltipContent>
+        </Tooltip>
+      ),
+    },
+    {
+      key: 'attach',
+      node: (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              className="size-[36px] shrink-0 rounded-full text-foreground/60 hover:text-foreground"
+              onClick={handleOpenFileDialog}
+            >
+              <Paperclip className="size-5" />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent side="top">
+            <p>添加附件</p>
+          </TooltipContent>
+        </Tooltip>
+      ),
+    },
+    { key: 'speech', node: <SpeechButton className="size-[36px] shrink-0 rounded-full" /> },
+    { key: 'tools', node: <ToolSelectorPopover /> },
+    { key: 'context', node: <ContextSettingsPopover /> },
+    { key: 'clear', node: <ClearContextButton onClick={onClearContext} /> },
+  ], [handleOpenFileDialog, thinkingEnabled, setThinkingEnabled, onClearContext])
+
+  const trailingNode = streaming ? (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon"
+          className="size-[36px] rounded-full text-destructive hover:!text-[hsl(0,75%,55%)] hover:!bg-[var(--stop-hover-bg)]"
+          onClick={onStop}
+        >
+          <Square className="size-[16px]" fill="currentColor" strokeWidth={0} />
+        </Button>
+      </TooltipTrigger>
+      <TooltipContent side="top">
+        <p>停止 Agent ({getAcceleratorDisplay(getActiveAccelerator('stop-generation'))})</p>
+      </TooltipContent>
+    </Tooltip>
+  ) : (
+    <Button
+      type="button"
+      variant="ghost"
+      size="icon"
+      className={cn(
+        'size-[36px] rounded-full',
+        canSend
+          ? 'text-primary hover:bg-primary/10'
+          : 'text-foreground/30 cursor-not-allowed'
+      )}
+      onClick={handleSend}
+      disabled={!canSend}
+    >
+      <CornerDownLeft className="size-[22px]" />
+    </Button>
+  )
+
   return (
     <div className="px-2.5 pb-2.5 md:px-[18px] md:pb-[18px]" data-input-mode="chat">
         {/* 卡片式输入容器 — 对标 Cherry Studio: border-radius 17px, 0.5px border */}
@@ -254,6 +401,7 @@ export function ChatInput({ conversationId, streaming, pendingAttachments, onSet
                   mediaType={att.mediaType}
                   previewUrl={att.previewUrl}
                   onRemove={() => handleRemoveAttachment(att.id)}
+                  onEditComplete={(editedDataUrl) => handleEditComplete(att.id, editedDataUrl)}
                 />
               ))}
             </div>
@@ -270,93 +418,8 @@ export function ChatInput({ conversationId, streaming, pendingAttachments, onSet
             sendWithCmdEnter={sendWithCmdEnter}
           />
 
-          {/* Footer 工具栏 — Cherry Studio: padding 5px 8px, height 40px, gap 16px */}
-          <div className="flex items-center justify-between px-2 py-1 h-[48px] gap-4">
-            {/* 左侧工具按钮 */}
-            <div className="flex items-center gap-1.5 flex-1 min-w-0">
-              {/* 附件按钮 */}
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="icon"
-                    className="size-[36px] rounded-full text-foreground/60 hover:text-foreground"
-                    onClick={handleOpenFileDialog}
-                  >
-                    <Paperclip className="size-5" />
-                  </Button>
-                </TooltipTrigger>
-                <TooltipContent side="top">
-                  <p>添加附件</p>
-                </TooltipContent>
-              </Tooltip>
-
-              <ModelSelector />
-
-              {/* 思考模式切换 */}
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="icon"
-                    className={cn(
-                      'size-[36px] rounded-full',
-                      thinkingEnabled ? 'text-green-500' : 'text-foreground/60 hover:text-foreground'
-                    )}
-                    onClick={() => setThinkingEnabled(!thinkingEnabled)}
-                  >
-                    <Brain className="size-5" />
-                  </Button>
-                </TooltipTrigger>
-                <TooltipContent side="top">
-                  <p>{thinkingEnabled ? '关闭思考模式' : '开启思考模式'}</p>
-                </TooltipContent>
-              </Tooltip>
-
-              <FeishuNotifyToggle sessionId={conversationId} />
-
-              <SpeechButton onTranscript={handleSpeechTranscript} />
-
-              <ToolSelectorPopover />
-
-              <ContextSettingsPopover />
-
-              <ClearContextButton onClick={onClearContext} />
-            </div>
-
-            {/* 右侧：发送 / 停止按钮 */}
-            <div className="flex items-center gap-1.5">
-              {streaming ? (
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="icon"
-                  className="size-[36px] rounded-full text-destructive hover:!text-[hsl(0,75%,55%)] hover:!bg-[var(--stop-hover-bg)]"
-                  onClick={onStop}
-                >
-                  <Square className="size-[16px]" fill="currentColor" strokeWidth={0} />
-                </Button>
-              ) : (
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="icon"
-                  className={cn(
-                    'size-[36px] rounded-full',
-                    canSend
-                      ? 'text-primary hover:bg-primary/10'
-                      : 'text-foreground/30 cursor-not-allowed'
-                  )}
-                  onClick={handleSend}
-                  disabled={!canSend}
-                >
-                  <CornerDownLeft className="size-[22px]" />
-                </Button>
-              )}
-            </div>
-          </div>
+          {/* Footer 工具栏 — 容器变窄时尾部按钮自动折叠进「更多」Popover */}
+          <InputToolbarOverflow items={toolbarItems} trailing={trailingNode} />
         </div>
     </div>
   )

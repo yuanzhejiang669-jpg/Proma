@@ -2,27 +2,43 @@
  * SearchDialog - 全局搜索 Dialog
  *
  * 浮动搜索面板，支持：
- * - 即时标题匹配（纯前端过滤）
- * - 渐进式消息内容搜索（debounce 后 IPC 调用）
- * - 匹配文字高亮
- * - 键盘导航（上下箭头 + Enter + Esc）
+ * - 手动触发搜索（点击搜索按钮 / 在输入框按 Enter）
+ * - 标题匹配 + 消息内容匹配统一渲染，匹配文字高亮
+ * - 键盘导航（上下箭头选择 + Enter 打开结果 + Esc 关闭）
  * - 同时搜索 Chat 和 Agent 模式
+ *
+ * 为什么手动触发：随着用户历史对话变多，自动搜索每次按键都会扫描全量 JSONL，
+ * 主进程被 IO 阻塞导致整体卡顿。改成手动触发后只在用户确认意图时执行一次。
+ *
+ * Enter 键的双重语义：
+ * - 已有搜索结果且选中项存在 → 打开选中的会话
+ * - 否则（首次搜索、修改了查询词等） → 触发搜索
  */
 
 import * as React from 'react'
 import { useAtom, useAtomValue, useSetAtom } from 'jotai'
 import { Search, X, MessageSquare, Bot, Archive, Loader2 } from 'lucide-react'
-import { Dialog, DialogContent, DialogTitle, DialogDescription } from '@/components/ui/dialog'
+import { Dialog, DialogContent, DialogPortal, DialogTitle } from '@/components/ui/dialog'
 import { cn } from '@/lib/utils'
 import { searchDialogOpenAtom } from '@/atoms/search-atoms'
-import { conversationsAtom } from '@/atoms/chat-atoms'
+import { conversationsAtom, channelsAtom } from '@/atoms/chat-atoms'
 import {
   agentSessionsAtom,
-  currentAgentWorkspaceIdAtom,
+  agentWorkspacesAtom,
+  agentChannelIdAtom,
+  agentPendingPromptAtom,
 } from '@/atoms/agent-atoms'
 import { activeViewAtom } from '@/atoms/active-view'
 import { useOpenSession } from '@/hooks/useOpenSession'
-import type { ConversationMeta, AgentSessionMeta, MessageSearchResult, AgentMessageSearchResult } from '@proma/shared'
+import { useCreateSession } from '@/hooks/useCreateSession'
+import {
+  SessionMiniMapPopover,
+  useSessionMiniMapHover,
+} from '@/components/session-preview/SessionMiniMapPopover'
+import type {
+  MessageSearchResult,
+  AgentMessageSearchResult,
+} from '@proma/shared'
 
 /** 标题搜索结果项 */
 interface TitleResult {
@@ -38,15 +54,20 @@ interface ContentResult {
   id: string
   title: string
   type: 'chat' | 'agent'
+  messageId: string
   snippet: string
   matchStart: number
   matchLength: number
   archived?: boolean
 }
 
-/**
- * 高亮文本中的匹配部分
- */
+type SearchResult = TitleResult | ContentResult
+
+function isContentResult(result: SearchResult): result is ContentResult {
+  return 'snippet' in result
+}
+
+/** 高亮文本中的匹配部分 */
 function HighlightText({ text, query }: { text: string; query: string }): React.ReactElement {
   if (!query) return <>{text}</>
 
@@ -76,9 +97,7 @@ function HighlightText({ text, query }: { text: string; query: string }): React.
   return <>{parts}</>
 }
 
-/**
- * 高亮 snippet 中的匹配部分（使用预计算位置）
- */
+/** 高亮 snippet 中的匹配部分（使用预计算位置） */
 function HighlightSnippet({ snippet, matchStart, matchLength }: {
   snippet: string
   matchStart: number
@@ -99,147 +118,274 @@ function HighlightSnippet({ snippet, matchStart, matchLength }: {
   )
 }
 
+function SearchResultIcon({ result }: { result: SearchResult }): React.ReactElement {
+  return result.type === 'chat' ? (
+    <MessageSquare size={14} className="flex-shrink-0 text-foreground/40" />
+  ) : (
+    <Bot size={14} className="flex-shrink-0 text-blue-500/70" />
+  )
+}
+
+interface SearchResultRowProps {
+  result: SearchResult
+  index: number
+  isSelected: boolean
+  committedQuery: string
+  getAgentWorkspaceName: (sessionId: string) => string | undefined
+  onSelect: (result: SearchResult) => void
+  onHover: (index: number) => void
+}
+
+function SearchResultRow({
+  result,
+  index,
+  isSelected,
+  committedQuery,
+  getAgentWorkspaceName,
+  onSelect,
+  onHover,
+}: SearchResultRowProps): React.ReactElement {
+  const preview = useSessionMiniMapHover(400)
+  const isContent = isContentResult(result)
+  const wsName = result.type === 'agent' ? getAgentWorkspaceName(result.id) : undefined
+
+  return (
+    <>
+      <button
+        ref={preview.setAnchorRef}
+        data-index={index}
+        onClick={() => onSelect(result)}
+        onMouseEnter={() => {
+          onHover(index)
+          preview.handleMouseEnter()
+        }}
+        onMouseLeave={preview.handleMouseLeave}
+        className={cn(
+          'w-full px-4 py-2 text-left transition-colors',
+          isContent ? 'flex flex-col gap-0.5' : 'flex items-center gap-2.5',
+          isSelected
+            ? 'bg-primary/10'
+            : 'hover:bg-foreground/[0.04]',
+          result.archived && 'opacity-60'
+        )}
+      >
+        <div className="flex items-center gap-2.5">
+          <SearchResultIcon result={result} />
+          <span className="flex-1 min-w-0 truncate text-[13px] text-foreground/80">
+            {isContent ? result.title : <HighlightText text={result.title} query={committedQuery} />}
+          </span>
+          {wsName && (
+            <span className="flex-shrink-0 px-1.5 py-0 rounded-full bg-foreground/[0.06] text-[10px] leading-4 text-foreground/40 font-medium truncate max-w-[80px]">
+              {wsName}
+            </span>
+          )}
+          {result.archived && (
+            <Archive size={12} className="flex-shrink-0 text-foreground/30" />
+          )}
+        </div>
+        {isContent && (
+          <div className="pl-[22px] text-[12px] text-foreground/50 truncate">
+            <HighlightSnippet
+              snippet={result.snippet}
+              matchStart={result.matchStart}
+              matchLength={result.matchLength}
+            />
+          </div>
+        )}
+      </button>
+      <SessionMiniMapPopover
+        target={{
+          type: result.type,
+          sessionId: result.id,
+          title: result.title,
+          workspaceName: wsName,
+        }}
+        anchorRef={preview.anchorRef}
+        open={preview.isOpen}
+        isLeaving={preview.isLeaving}
+        onMouseEnter={preview.handlePanelMouseEnter}
+        onMouseLeave={preview.handlePanelMouseLeave}
+      />
+    </>
+  )
+}
+
 export function SearchDialog(): React.ReactElement {
   const [open, setOpen] = useAtom(searchDialogOpenAtom)
   const conversations = useAtomValue(conversationsAtom)
   const agentSessions = useAtomValue(agentSessionsAtom)
+  const agentWorkspaces = useAtomValue(agentWorkspacesAtom)
+  const channels = useAtomValue(channelsAtom)
+  const currentAgentChannelId = useAtomValue(agentChannelIdAtom)
+  const setAgentPendingPrompt = useSetAtom(agentPendingPromptAtom)
   const setActiveView = useSetAtom(activeViewAtom)
-  const currentWorkspaceId = useAtomValue(currentAgentWorkspaceIdAtom)
   const openSession = useOpenSession()
+  const { createAgent } = useCreateSession()
 
+  const workspaceNameMap = React.useMemo(() => {
+    const map = new Map<string, string>()
+    for (const w of agentWorkspaces) map.set(w.id, w.name)
+    return map
+  }, [agentWorkspaces])
+
+  const getAgentWorkspaceName = React.useCallback((sessionId: string): string | undefined => {
+    const session = agentSessions.find((s) => s.id === sessionId)
+    if (!session?.workspaceId) return undefined
+    return workspaceNameMap.get(session.workspaceId)
+  }, [agentSessions, workspaceNameMap])
+
+  // query：输入框当前值（实时跟随用户）
+  // committedQuery：用户已确认提交的搜索词（点击/回车后才更新），用于结果展示与高亮
   const [query, setQuery] = React.useState('')
-  const [searchQuery, setSearchQuery] = React.useState('')
-  const [selectedIndex, setSelectedIndex] = React.useState(0)
+  const [committedQuery, setCommittedQuery] = React.useState('')
+  const [titleResults, setTitleResults] = React.useState<TitleResult[]>([])
   const [contentResults, setContentResults] = React.useState<ContentResult[]>([])
-  const [contentLoading, setContentLoading] = React.useState(false)
+  const [selectedIndex, setSelectedIndex] = React.useState(0)
+  const [loading, setLoading] = React.useState(false)
+  const [hasSearched, setHasSearched] = React.useState(false)
   const inputRef = React.useRef<HTMLInputElement>(null)
   const listRef = React.useRef<HTMLDivElement>(null)
   const isComposingRef = React.useRef(false)
-  const commitTimerRef = React.useRef<ReturnType<typeof setTimeout>>()
-
-  /**
-   * 提交搜索词（微 debounce 60ms）
-   *
-   * 为什么需要这一层：中文输入法下 compositionend 和 onChange 的触发顺序
-   * 在 Chrome / Firefox / Safari 之间不一致。微 debounce 保证无论事件顺序如何，
-   * 最终都能拿到用户确认后的完整文本，避免逐字输入时搜索结果跳动。
-   * 60ms 对人眼不可感知，但足以合并同一次 composition 的所有事件。
-   */
-  const commitSearchQuery = React.useCallback((value: string) => {
-    clearTimeout(commitTimerRef.current)
-    commitTimerRef.current = setTimeout(() => setSearchQuery(value), 60)
-  }, [])
+  // 用 ref 持有当前请求的 token，发起新请求时使旧请求结果作废
+  const searchTokenRef = React.useRef(0)
 
   const handleInputChange = React.useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
-    const value = e.target.value
-    setQuery(value)
-    if (!isComposingRef.current) {
-      commitSearchQuery(value)
-    }
-  }, [commitSearchQuery])
+    setQuery(e.target.value)
+  }, [])
 
   const handleCompositionStart = React.useCallback(() => {
     isComposingRef.current = true
   }, [])
 
-  const handleCompositionEnd = React.useCallback((e: React.CompositionEvent<HTMLInputElement>) => {
+  const handleCompositionEnd = React.useCallback(() => {
     isComposingRef.current = false
-    // 不直接读 e.currentTarget.value（在部分浏览器中可能拿到中间态），
-    // 而是通过 commitSearchQuery 让微 debounce 等 onChange 也触发后再提交
-    commitSearchQuery(e.currentTarget.value)
-  }, [commitSearchQuery])
-
-  const handleClearQuery = React.useCallback(() => {
-    clearTimeout(commitTimerRef.current)
-    setQuery('')
-    setSearchQuery('')
   }, [])
 
-  // 标题搜索：即时响应，纯内存过滤，基于 searchQuery 避免输入法抖动
-  const titleResults = React.useMemo((): TitleResult[] => {
-    if (!searchQuery) return []
-    const q = searchQuery.toLowerCase()
+  const handleClearQuery = React.useCallback(() => {
+    setQuery('')
+    setCommittedQuery('')
+    setTitleResults([])
+    setContentResults([])
+    setHasSearched(false)
+    setSelectedIndex(0)
+    searchTokenRef.current += 1
+    setLoading(false)
+    inputRef.current?.focus()
+  }, [])
 
-    const chatMatches: TitleResult[] = conversations
-      .filter((c) => c.title.toLowerCase().includes(q))
-      .map((c) => ({ id: c.id, title: c.title, type: 'chat' as const, archived: c.archived, updatedAt: c.updatedAt }))
-
-    const agentMatches: TitleResult[] = agentSessions
-      .filter((s) => s.title.toLowerCase().includes(q))
-      .map((s) => ({ id: s.id, title: s.title, type: 'agent' as const, archived: s.archived, updatedAt: s.updatedAt }))
-
-    return [...chatMatches, ...agentMatches]
-      .sort((a, b) => b.updatedAt - a.updatedAt)
-      .slice(0, 20)
-  }, [searchQuery, conversations, agentSessions])
-
-  // 内容搜索：debounce 300ms 后 IPC 调用，基于 searchQuery
-  React.useEffect(() => {
-    if (!searchQuery || searchQuery.length < 2) {
+  /**
+   * 执行一次搜索：标题前端过滤 + 内容主进程 IPC 并行调用。
+   *
+   * 通过 token 隔离多次手动触发——若用户在搜索进行中再次触发，旧 token 的结果会被丢弃。
+   */
+  const runSearch = React.useCallback(async () => {
+    const q = query.trim()
+    if (!q || q.length < 2) {
+      setTitleResults([])
       setContentResults([])
-      setContentLoading(false)
+      setHasSearched(false)
+      setCommittedQuery('')
       return
     }
 
-    setContentLoading(true)
-    let cancelled = false
+    const token = ++searchTokenRef.current
+    setCommittedQuery(q)
+    setHasSearched(true)
+    setLoading(true)
+    setSelectedIndex(0)
 
-    const timer = setTimeout(async () => {
-      try {
-        const [chatResults, agentResults] = await Promise.all([
-          window.electronAPI.searchConversationMessages(searchQuery),
-          window.electronAPI.searchAgentSessionMessages(searchQuery),
-        ])
-        if (cancelled) return
+    const qLower = q.toLowerCase()
+    const titles: TitleResult[] = [
+      ...conversations
+        .filter((c) => c.title.toLowerCase().includes(qLower))
+        .map((c) => ({ id: c.id, title: c.title, type: 'chat' as const, archived: c.archived, updatedAt: c.updatedAt })),
+      ...agentSessions
+        .filter((s) => s.title.toLowerCase().includes(qLower))
+        .map((s) => ({ id: s.id, title: s.title, type: 'agent' as const, archived: s.archived, updatedAt: s.updatedAt })),
+    ]
+      .sort((a, b) => b.updatedAt - a.updatedAt)
+      .slice(0, 20)
 
-        const titleIds = new Set(titleResults.map((t) => t.id))
+    setTitleResults(titles)
 
-        const chatContent: ContentResult[] = (chatResults as MessageSearchResult[])
-          .filter((r) => !titleIds.has(r.conversationId))
-          .map((r) => ({
-            id: r.conversationId,
-            title: r.conversationTitle,
-            type: 'chat' as const,
-            snippet: r.snippet,
-            matchStart: r.matchStart,
-            matchLength: r.matchLength,
-            archived: r.archived,
-          }))
+    try {
+      const [chatResults, agentResults] = await Promise.all([
+        window.electronAPI.searchConversationMessages(q),
+        window.electronAPI.searchAgentSessionMessages(q),
+      ])
+      if (token !== searchTokenRef.current) return
 
-        const agentContent: ContentResult[] = (agentResults as AgentMessageSearchResult[])
-          .filter((r) => !titleIds.has(r.sessionId))
-          .map((r) => ({
-            id: r.sessionId,
-            title: r.sessionTitle,
-            type: 'agent' as const,
-            snippet: r.snippet,
-            matchStart: r.matchStart,
-            matchLength: r.matchLength,
-            archived: r.archived,
-          }))
+      const titleIds = new Set(titles.map((t) => t.id))
+      const chatContent: ContentResult[] = (chatResults as MessageSearchResult[])
+        .filter((r) => !titleIds.has(r.conversationId))
+        .map((r) => ({
+          id: r.conversationId,
+          title: r.conversationTitle,
+          type: 'chat' as const,
+          messageId: r.messageId,
+          snippet: r.snippet,
+          matchStart: r.matchStart,
+          matchLength: r.matchLength,
+          archived: r.archived,
+        }))
+      const agentContent: ContentResult[] = (agentResults as AgentMessageSearchResult[])
+        .filter((r) => !titleIds.has(r.sessionId))
+        .map((r) => ({
+          id: r.sessionId,
+          title: r.sessionTitle,
+          type: 'agent' as const,
+          messageId: r.messageId,
+          snippet: r.snippet,
+          matchStart: r.matchStart,
+          matchLength: r.matchLength,
+          archived: r.archived,
+        }))
 
-        setContentResults([...chatContent, ...agentContent])
-      } catch (error) {
-        console.error('[搜索] 内容搜索失败:', error)
-        if (!cancelled) setContentResults([])
-      } finally {
-        if (!cancelled) setContentLoading(false)
-      }
-    }, 300)
+      setContentResults([...chatContent, ...agentContent])
+    } catch (error) {
+      console.error('[搜索] 内容搜索失败:', error)
+      if (token === searchTokenRef.current) setContentResults([])
+    } finally {
+      if (token === searchTokenRef.current) setLoading(false)
+    }
+  }, [query, conversations, agentSessions])
 
-    return () => { cancelled = true; clearTimeout(timer) }
-  }, [searchQuery, titleResults])
+  const handleAgentSearch = React.useCallback(async () => {
+    const q = query.trim()
+    if (!q) return
 
-  // 全部结果列表
-  const allResults = React.useMemo(
-    () => [...titleResults, ...contentResults.map((c) => ({ ...c, updatedAt: 0 }))],
+    const deepseekChannel = channels.find(
+      (c) => c.enabled && c.models.some((m) => m.id === 'deepseek-v4-flash' && m.enabled)
+    )
+    const channelId = deepseekChannel?.id ?? currentAgentChannelId ?? undefined
+
+    const configDir = import.meta.env.DEV ? '.proma-dev' : '.proma'
+    const prompt = `请帮我在 Proma 的全部会话历史中搜索与以下描述相关的内容：
+
+"${q}"
+
+搜索范围：
+- Chat 会话消息文件：~/${configDir}/conversations/ 目录下所有 .jsonl 文件
+- Agent 会话消息文件：~/${configDir}/agent-sessions/ 目录下所有 .jsonl 文件
+
+要求：
+1. 理解用户描述的语义，不要求关键词完全匹配，根据内容相关性判断
+2. 找到相关会话后，给出会话标题、相关内容摘要，以及文件路径
+3. 按相关性排序，最相关的结果排在最前面`
+
+    const sessionId = await createAgent({ channelId })
+    if (!sessionId) return
+
+    setAgentPendingPrompt({ sessionId, message: prompt })
+    setOpen(false)
+    setActiveView('conversations')
+  }, [query, channels, currentAgentChannelId, createAgent, setAgentPendingPrompt, setOpen, setActiveView])
+
+  // 全部结果列表（标题在前、内容在后）
+  const allResults = React.useMemo<SearchResult[]>(
+    () => [...titleResults, ...contentResults],
     [titleResults, contentResults]
   )
-
-  // 重置选中索引
-  React.useEffect(() => {
-    setSelectedIndex(0)
-  }, [searchQuery])
 
   // 导航到对话/会话
   const navigateToResult = React.useCallback((result: TitleResult | ContentResult) => {
@@ -257,19 +403,31 @@ export function SearchDialog(): React.ReactElement {
     }
   }, [setOpen, setActiveView, openSession, conversations, agentSessions])
 
-  // 键盘导航
-  const handleKeyDown = React.useCallback((e: React.KeyboardEvent) => {
-    if (e.key === 'ArrowDown') {
+  /**
+   * Enter 键语义：
+   * - 输入法 composition 中 → 让浏览器处理（确认候选词），不做任何事
+   * - 用户改了搜索词、或还没搜过 → 触发搜索
+   * - 否则（搜索词未变且有结果）→ 打开当前选中项
+   */
+  const handleKeyDown = React.useCallback((e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === 'Enter') {
+      if (isComposingRef.current) return
+      e.preventDefault()
+      const trimmed = query.trim()
+      const isQueryDirty = trimmed !== committedQuery
+      if (isQueryDirty || !hasSearched) {
+        void runSearch()
+      } else if (allResults[selectedIndex]) {
+        navigateToResult(allResults[selectedIndex]!)
+      }
+    } else if (e.key === 'ArrowDown') {
       e.preventDefault()
       setSelectedIndex((prev) => Math.min(prev + 1, allResults.length - 1))
     } else if (e.key === 'ArrowUp') {
       e.preventDefault()
       setSelectedIndex((prev) => Math.max(prev - 1, 0))
-    } else if (e.key === 'Enter' && allResults[selectedIndex]) {
-      e.preventDefault()
-      navigateToResult(allResults[selectedIndex]!)
     }
-  }, [allResults, selectedIndex, navigateToResult])
+  }, [query, committedQuery, hasSearched, allResults, selectedIndex, runSearch, navigateToResult])
 
   // 自动滚动选中项到可视区域
   React.useEffect(() => {
@@ -281,26 +439,44 @@ export function SearchDialog(): React.ReactElement {
     }
   }, [selectedIndex])
 
-  // 全局快捷键 Cmd+F 已迁移到 GlobalShortcuts 组件统一管理
-
   // 打开时重置状态并聚焦
   React.useEffect(() => {
     if (open) {
-      clearTimeout(commitTimerRef.current)
+      searchTokenRef.current += 1
       setQuery('')
-      setSearchQuery('')
+      setCommittedQuery('')
+      setTitleResults([])
       setContentResults([])
+      setHasSearched(false)
       setSelectedIndex(0)
+      setLoading(false)
       setTimeout(() => inputRef.current?.focus(), 50)
     }
   }, [open])
 
+  const trimmedQuery = query.trim()
+  const canSearch = trimmedQuery.length >= 2 && !loading
+  const isQueryDirty = trimmedQuery !== committedQuery
+
   return (
-    <Dialog open={open} onOpenChange={setOpen}>
+    <Dialog open={open} onOpenChange={setOpen} modal={false}>
+      {/* 非交互式背景遮罩：modal=false 时 Radix 不渲染原生 overlay（避免拦截 hover 预览的事件），
+       * 这里手动通过 DialogPortal 在 document.body 渲染一个 pointer-events-none 的 blur 层——
+       * Portal 是关键：直接渲染会被父级 stacking context（如 MainContentPanel）困住，导致只覆盖到
+       * 左侧栏；用 Portal 后 fixed inset-0 真正覆盖整个视口。
+       * z-[99] 在 DialogContent (z-[100]) 之下，在所有 app 内容之上。
+       */}
+      {open && (
+        <DialogPortal>
+          <div
+            aria-hidden
+            className="fixed inset-0 z-[99] bg-black/40 pointer-events-none animate-in fade-in-0 duration-150"
+          />
+        </DialogPortal>
+      )}
       <DialogContent
         hideClose
         className="sm:max-w-[520px] p-0 gap-0 overflow-hidden"
-        onKeyDown={handleKeyDown}
         aria-describedby={undefined}
       >
         <DialogTitle className="sr-only">搜索对话</DialogTitle>
@@ -313,33 +489,78 @@ export function SearchDialog(): React.ReactElement {
             onChange={handleInputChange}
             onCompositionStart={handleCompositionStart}
             onCompositionEnd={handleCompositionEnd}
-            placeholder="搜索对话和会话..."
+            onKeyDown={handleKeyDown}
+            placeholder="输入关键词，按 Enter 或点击搜索"
             className="flex-1 bg-transparent text-[14px] text-foreground placeholder:text-foreground/40 outline-none"
           />
           {query && (
             <button
               onClick={handleClearQuery}
+              title="清空"
               className="p-0.5 rounded text-foreground/30 hover:text-foreground/60 transition-colors"
             >
               <X size={14} />
             </button>
           )}
-          <kbd className="hidden sm:inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded bg-foreground/[0.06] text-[11px] text-foreground/40 font-mono">
-            ESC
-          </kbd>
+          <button
+            onClick={() => void runSearch()}
+            disabled={!canSearch}
+            className={cn(
+              'flex items-center gap-1 px-2 py-1 rounded text-[12px] font-medium transition-colors',
+              canSearch
+                ? 'bg-primary text-primary-foreground hover:bg-primary/90'
+                : 'bg-foreground/[0.06] text-foreground/30 cursor-not-allowed'
+            )}
+          >
+            {loading ? <Loader2 size={12} className="animate-spin" /> : <Search size={12} />}
+            <span>搜索</span>
+          </button>
+          <button
+            onClick={() => void handleAgentSearch()}
+            disabled={trimmedQuery.length < 2}
+            title="适合在精准搜索找不到的情况下使用，Agent 会帮助你搜索整个 Proma 会话空间"
+            className={cn(
+              'flex items-center gap-1 px-2 py-1 rounded text-[12px] font-medium transition-colors',
+              trimmedQuery.length >= 2
+                ? 'bg-blue-500/10 text-blue-500 hover:bg-blue-500/20'
+                : 'bg-foreground/[0.06] text-foreground/30 cursor-not-allowed'
+            )}
+          >
+            <Bot size={12} />
+            <span>Agent 搜索</span>
+          </button>
         </div>
 
         {/* 搜索结果 */}
-        <div ref={listRef} className="max-h-[400px] overflow-y-auto">
-          {!query && (
+        <div className="relative">
+          <div ref={listRef} className="max-h-[400px] overflow-y-auto scrollbar-thin">
+          {!hasSearched && (
             <div className="py-12 text-center text-[13px] text-foreground/40">
-              输入关键词搜索对话标题和消息内容
+              {trimmedQuery.length === 0
+                ? '输入关键词后按 Enter 或点击搜索'
+                : trimmedQuery.length < 2
+                  ? '关键词至少需要 2 个字符'
+                  : '按 Enter 或点击搜索开始查找'}
             </div>
           )}
 
-          {searchQuery && titleResults.length === 0 && contentResults.length === 0 && !contentLoading && (
-            <div className="py-12 text-center text-[13px] text-foreground/40">
-              未找到匹配结果
+          {hasSearched && loading && allResults.length === 0 && (
+            <div className="py-12 flex items-center justify-center gap-2 text-[13px] text-foreground/40">
+              <Loader2 size={14} className="animate-spin" />
+              <span>正在搜索...</span>
+            </div>
+          )}
+
+          {hasSearched && !loading && allResults.length === 0 && (
+            <div className="py-8 flex flex-col items-center gap-3 text-[13px] text-foreground/40">
+              <span>未找到匹配结果</span>
+              <button
+                onClick={() => void handleAgentSearch()}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-[12px] font-medium bg-blue-500/10 text-blue-500 hover:bg-blue-500/20 transition-colors"
+              >
+                <Bot size={12} />
+                <span>试试 Agent 搜索</span>
+              </button>
             </div>
           )}
 
@@ -350,102 +571,61 @@ export function SearchDialog(): React.ReactElement {
                 标题匹配
               </div>
               {titleResults.map((result, idx) => (
-                <button
+                <SearchResultRow
                   key={`title-${result.id}`}
-                  data-index={idx}
-                  onClick={() => navigateToResult(result)}
-                  onMouseEnter={() => setSelectedIndex(idx)}
-                  className={cn(
-                    'w-full flex items-center gap-2.5 px-4 py-2 text-left transition-colors',
-                    selectedIndex === idx
-                      ? 'bg-primary/10'
-                      : 'hover:bg-foreground/[0.04]',
-                    result.archived && 'opacity-60'
-                  )}
-                >
-                  {result.type === 'chat' ? (
-                    <MessageSquare size={14} className="flex-shrink-0 text-foreground/40" />
-                  ) : (
-                    <Bot size={14} className="flex-shrink-0 text-blue-500/70" />
-                  )}
-                  <span className="flex-1 min-w-0 truncate text-[13px] text-foreground/80">
-                    <HighlightText text={result.title} query={searchQuery} />
-                  </span>
-                  {result.archived && (
-                    <Archive size={12} className="flex-shrink-0 text-foreground/30" />
-                  )}
-                </button>
+                  result={result}
+                  index={idx}
+                  isSelected={selectedIndex === idx}
+                  committedQuery={committedQuery}
+                  getAgentWorkspaceName={getAgentWorkspaceName}
+                  onSelect={navigateToResult}
+                  onHover={setSelectedIndex}
+                />
               ))}
             </div>
           )}
 
           {/* 内容匹配区域 */}
-          {(contentResults.length > 0 || (contentLoading && searchQuery.length >= 2)) && (
+          {(contentResults.length > 0 || (loading && hasSearched && titleResults.length > 0)) && (
             <div className="py-1 border-t border-border/30 animate-in fade-in duration-150">
               <div className="px-4 pt-2 pb-1 flex items-center gap-2 text-[11px] font-medium text-foreground/40 select-none">
                 <span>消息内容匹配</span>
-                {contentLoading && <Loader2 size={12} className="animate-spin text-foreground/30" />}
+                {loading && <Loader2 size={12} className="animate-spin text-foreground/30" />}
               </div>
-              {contentResults.map((result, i) => {
-                const globalIdx = titleResults.length + i
-                return (
-                  <button
-                    key={`content-${result.id}`}
-                    data-index={globalIdx}
-                    onClick={() => navigateToResult(result)}
-                    onMouseEnter={() => setSelectedIndex(globalIdx)}
-                    className={cn(
-                      'w-full flex flex-col gap-0.5 px-4 py-2 text-left transition-colors',
-                      selectedIndex === globalIdx
-                        ? 'bg-primary/10'
-                        : 'hover:bg-foreground/[0.04]',
-                      result.archived && 'opacity-60'
-                    )}
-                  >
-                    <div className="flex items-center gap-2.5">
-                      {result.type === 'chat' ? (
-                        <MessageSquare size={14} className="flex-shrink-0 text-foreground/40" />
-                      ) : (
-                        <Bot size={14} className="flex-shrink-0 text-blue-500/70" />
-                      )}
-                      <span className="flex-1 min-w-0 truncate text-[13px] text-foreground/80">
-                        {result.title}
-                      </span>
-                      {result.archived && (
-                        <Archive size={12} className="flex-shrink-0 text-foreground/30" />
-                      )}
-                    </div>
-                    <div className="pl-[22px] text-[12px] text-foreground/50 truncate">
-                      <HighlightSnippet
-                        snippet={result.snippet}
-                        matchStart={result.matchStart}
-                        matchLength={result.matchLength}
-                      />
-                    </div>
-                  </button>
-                )
-              })}
+              {contentResults.map((result, i) => (
+                <SearchResultRow
+                  key={`content-${result.id}-${result.messageId}`}
+                  result={result}
+                  index={titleResults.length + i}
+                  isSelected={selectedIndex === titleResults.length + i}
+                  committedQuery={committedQuery}
+                  getAgentWorkspaceName={getAgentWorkspaceName}
+                  onSelect={navigateToResult}
+                  onHover={setSelectedIndex}
+                />
+              ))}
             </div>
           )}
+          </div>
         </div>
 
         {/* 底部快捷键提示 */}
-        {allResults.length > 0 && (
-          <div className="flex items-center gap-3 px-4 py-2 border-t border-border/30 text-[11px] text-foreground/30">
+        <div className="flex items-center gap-3 px-4 py-2 border-t border-border/30 text-[11px] text-foreground/30">
+          <span className="flex items-center gap-1">
+            <kbd className="px-1 py-0.5 rounded bg-foreground/[0.06] font-mono">↵</kbd>
+            <span>{isQueryDirty || !hasSearched ? '搜索' : '打开'}</span>
+          </span>
+          {allResults.length > 0 && (
             <span className="flex items-center gap-1">
               <kbd className="px-1 py-0.5 rounded bg-foreground/[0.06] font-mono">↑↓</kbd>
               <span>选择</span>
             </span>
-            <span className="flex items-center gap-1">
-              <kbd className="px-1 py-0.5 rounded bg-foreground/[0.06] font-mono">↵</kbd>
-              <span>打开</span>
-            </span>
-            <span className="flex items-center gap-1">
-              <kbd className="px-1 py-0.5 rounded bg-foreground/[0.06] font-mono">Esc</kbd>
-              <span>关闭</span>
-            </span>
-          </div>
-        )}
+          )}
+          <span className="flex items-center gap-1">
+            <kbd className="px-1 py-0.5 rounded bg-foreground/[0.06] font-mono">Esc</kbd>
+            <span>关闭</span>
+          </span>
+        </div>
       </DialogContent>
     </Dialog>
   )

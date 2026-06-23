@@ -22,14 +22,17 @@ import {
   Zap,
   Download,
   Search,
-  Check,
 } from 'lucide-react'
+import { toast } from 'sonner'
+import { useSetAtom } from 'jotai'
+import { channelFormDirtyAtom } from '@/atoms/settings-tab'
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import {
   PROVIDER_DEFAULT_URLS,
   PROVIDER_LABELS,
+  isAgentCompatibleProvider,
 } from '@proma/shared'
 import type {
   Channel,
@@ -39,7 +42,19 @@ import type {
   FetchModelsResult,
   ProviderType,
 } from '@proma/shared'
+import { normalizeAnthropicProviderUrl } from '@proma/core'
+import { getProviderLogo } from '@/lib/model-logo'
 import { ScrollArea } from '@/components/ui/scroll-area'
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog'
 import {
   SettingsSection,
   SettingsCard,
@@ -51,57 +66,77 @@ import {
 interface ChannelFormProps {
   /** 编辑模式下传入已有渠道，创建模式传 null */
   channel: Channel | null
-  onSaved: () => void
+  onSaved: (channel?: Channel) => void
+  onAgentEligibilityChange?: (channel: Channel, eligible: boolean) => void | Promise<void>
   onCancel: () => void
 }
 
 /** 所有可选供应商 */
-const PROVIDER_OPTIONS: ProviderType[] = ['anthropic', 'openai', 'deepseek', 'google', 'moonshot', 'zhipu', 'minimax', 'doubao', 'qwen', 'custom']
+const PROVIDER_OPTIONS: ProviderType[] = ['anthropic', 'anthropic-compatible', 'openai', 'deepseek', 'google', 'kimi-api', 'kimi-coding', 'zhipu', 'zhipu-coding', 'minimax', 'doubao', 'qwen', 'qwen-anthropic', 'xiaomi', 'xiaomi-token-plan', 'custom']
 
 /** 供应商选项（用于 SettingsSelect） */
 const PROVIDER_SELECT_OPTIONS = PROVIDER_OPTIONS.map((p) => ({
   value: p,
   label: PROVIDER_LABELS[p],
+  icon: getProviderLogo(p),
 }))
 
 /** 各供应商的 Chat 端点路径，用于 Base URL 预览 */
 const PROVIDER_CHAT_PATHS: Record<ProviderType, string> = {
   anthropic: '/v1/messages',
+  'anthropic-compatible': '/v1/messages',
   openai: '/chat/completions',
-  deepseek: '/chat/completions',
+  deepseek: '/messages',
   google: '/v1beta/models/{model}:generateContent',
-  moonshot: '/chat/completions',
+  'kimi-api': '/messages',
+  'kimi-coding': '/messages',
   zhipu: '/chat/completions',
-  minimax: '/chat/completions',
+  'zhipu-coding': '/messages',
+  minimax: '/v1/messages',
   doubao: '/chat/completions',
   qwen: '/chat/completions',
+  'qwen-anthropic': '/v1/messages',
+  xiaomi: '/v1/messages',
+  'xiaomi-token-plan': '/v1/messages',
   custom: '/chat/completions',
 }
+
+/** 走 Anthropic 协议的供应商集合（共用 /v1/messages 端点） */
+const ANTHROPIC_PROTOCOL_PROVIDERS: ReadonlySet<ProviderType> = new Set<ProviderType>([
+  'anthropic',
+  'anthropic-compatible',
+  'deepseek',
+  'kimi-api',
+  'kimi-coding',
+  'zhipu-coding',
+  'minimax',
+  'xiaomi',
+  'xiaomi-token-plan',
+  'qwen-anthropic',
+])
 
 /**
  * 生成 API 端点预览 URL
  *
- * Anthropic 特殊处理：如果 baseUrl 已包含 /v1，则不重复添加。
+ * Anthropic 协议供应商：复用 normalizeAnthropicProviderUrl 计算 base，再拼 /messages，
+ * 与运行时 channel-manager / AnthropicAdapter 的规范化逻辑保持一致。
  */
 function buildPreviewUrl(baseUrl: string, provider: ProviderType): string {
-  let trimmed = baseUrl.trim().replace(/\/+$/, '')
-
-  if (provider === 'anthropic') {
-    // 去除用户误填的 /messages 后缀，与 normalizeAnthropicBaseUrl 保持一致
-    trimmed = trimmed.replace(/\/messages$/, '')
-    if (trimmed.match(/\/v\d+$/)) {
-      return `${trimmed}/messages`
-    }
-    return `${trimmed}/v1/messages`
+  if (ANTHROPIC_PROTOCOL_PROVIDERS.has(provider)) {
+    return `${normalizeAnthropicProviderUrl(baseUrl, provider)}/messages`
   }
-
+  const trimmed = baseUrl.trim().replace(/\/+$/, '')
   return `${trimmed}${PROVIDER_CHAT_PATHS[provider]}`
 }
 
 /** auto-save 防抖延迟 */
 const AUTO_SAVE_DELAY = 600
 
-export function ChannelForm({ channel, onSaved, onCancel }: ChannelFormProps): React.ReactElement {
+function isAgentEligibleChannel(channel: Pick<Channel, 'provider' | 'enabled'>): boolean {
+  return channel.enabled && isAgentCompatibleProvider(channel.provider)
+}
+
+export function ChannelForm({ channel, onSaved, onAgentEligibilityChange, onCancel }: ChannelFormProps): React.ReactElement {
   const isEdit = channel !== null
 
   // 表单状态
@@ -127,10 +162,16 @@ export function ChannelForm({ channel, onSaved, onCancel }: ChannelFormProps): R
   const [fetchingModels, setFetchingModels] = React.useState(false)
   const [fetchResult, setFetchResult] = React.useState<FetchModelsResult | null>(null)
   const [apiKeyLoaded, setApiKeyLoaded] = React.useState(false)
-  /** auto-save 状态指示 */
-  const [autoSaveStatus, setAutoSaveStatus] = React.useState<'idle' | 'saving' | 'saved'>('idle')
+  const [showExitDialog, setShowExitDialog] = React.useState(false)
 
-  // 编辑模式下加载明文 API Key
+  const setChannelFormDirty = useSetAtom(channelFormDirtyAtom)
+  const lastAgentEligibleRef = React.useRef(channel ? isAgentEligibleChannel(channel) : false)
+
+  React.useEffect(() => {
+    lastAgentEligibleRef.current = channel ? isAgentEligibleChannel(channel) : false
+  }, [channel])
+
+  /** 编辑模式下加载明文 API Key */
   React.useEffect(() => {
     if (isEdit && channel && !apiKeyLoaded) {
       window.electronAPI.decryptApiKey(channel.id).then((key) => {
@@ -158,9 +199,8 @@ export function ChannelForm({ channel, onSaved, onCancel }: ChannelFormProps): R
     currentEnabled: boolean,
   ) => {
     if (!isEdit || !channel) return
-    setAutoSaveStatus('saving')
     try {
-      await window.electronAPI.updateChannel(channel.id, {
+      const savedChannel = await window.electronAPI.updateChannel(channel.id, {
         name: currentName,
         provider: currentProvider,
         baseUrl: currentBaseUrl,
@@ -168,13 +208,17 @@ export function ChannelForm({ channel, onSaved, onCancel }: ChannelFormProps): R
         models: currentModels,
         enabled: currentEnabled,
       })
-      setAutoSaveStatus('saved')
-      setTimeout(() => setAutoSaveStatus('idle'), 1500)
+      const eligible = isAgentEligibleChannel(savedChannel)
+      if (eligible !== lastAgentEligibleRef.current) {
+        lastAgentEligibleRef.current = eligible
+        await onAgentEligibilityChange?.(savedChannel, eligible)
+      }
+      toast.success('已保存', { id: 'auto-save-success' })
     } catch (error) {
       console.error('[模型配置表单] auto-save 失败:', error)
-      setAutoSaveStatus('idle')
+      toast.error('自动保存失败，请检查后手动重试', { id: 'auto-save-error' })
     }
-  }, [isEdit, channel])
+  }, [isEdit, channel, onAgentEligibilityChange])
 
   /** 触发防抖 auto-save */
   const scheduleAutoSave = React.useCallback((
@@ -210,12 +254,57 @@ export function ChannelForm({ channel, onSaved, onCancel }: ChannelFormProps): R
     return () => { if (autoSaveTimerRef.current) clearTimeout(autoSaveTimerRef.current) }
   }, [models, name, provider, baseUrl, apiKey, enabled, scheduleAutoSave])
 
-  // 切换供应商时自动更新 Base URL
+  // 切换供应商时自动更新 Base URL 与名称，Anthropic 兼容渠道自动添加预设模型
   const handleProviderChange = (newProvider: string): void => {
     const p = newProvider as ProviderType
+    // 若 name 为空或仍是上一个 provider 的默认名称，则用新 provider 的名称覆盖；用户手动改过的 name 不动
+    const trimmedName = name.trim()
+    if (!trimmedName || trimmedName === PROVIDER_LABELS[provider]) {
+      setName(PROVIDER_LABELS[p])
+    }
     setProvider(p)
     setBaseUrl(PROVIDER_DEFAULT_URLS[p])
     setTestResult(null)
+    // 预设模型：首次切换到对应 provider 且无模型时自动填充
+    if (models.length === 0) {
+      if (p === 'deepseek') {
+        setModels([
+          { id: 'deepseek-v4-pro', name: 'DeepSeek V4 Pro', enabled: true },
+          { id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash', enabled: true },
+        ])
+      } else if (p === 'kimi-api') {
+        setModels([
+          { id: 'kimi-k2.6', name: 'Kimi K2.6', enabled: true },
+        ])
+      } else if (p === 'kimi-coding') {
+        setModels([
+          { id: 'kimi-for-coding', name: 'Kimi for Coding', enabled: true },
+        ])
+      } else if (p === 'zhipu' || p === 'zhipu-coding') {
+        setModels([
+          { id: 'glm-5.2', name: 'GLM-5.2', enabled: true },
+          { id: 'glm-5.1', name: 'GLM-5.1', enabled: false },
+        ])
+      } else if (p === 'minimax') {
+        setModels([
+          { id: 'MiniMax-M3', name: 'MiniMax-M3', enabled: true },
+          { id: 'MiniMax-M2.7', name: 'MiniMax-M2.7', enabled: true },
+        ])
+      } else if (p === 'xiaomi' || p === 'xiaomi-token-plan') {
+        setModels([
+          { id: 'mimo-v2.5-pro', name: 'MiMo V2.5 Pro', enabled: true },
+          { id: 'mimo-v2-pro', name: 'MiMo V2 Pro', enabled: true },
+          { id: 'mimo-v2.5', name: 'MiMo V2.5', enabled: true },
+          { id: 'mimo-v2-omni', name: 'MiMo V2 Omni', enabled: true },
+          { id: 'mimo-v2-flash', name: 'MiMo V2 Flash', enabled: true },
+        ])
+      } else if (p === 'qwen-anthropic') {
+        setModels([
+          { id: 'qwen3.7-max', name: 'Qwen3.7 Max', enabled: true },
+          { id: 'qwen3.7-plus', name: 'Qwen3.7 Plus', enabled: true },
+        ])
+      }
+    }
   }
 
   /** 添加模型 */
@@ -226,6 +315,7 @@ export function ChannelForm({ channel, onSaved, onCancel }: ChannelFormProps): R
       id: newModelId.trim(),
       name: newModelName.trim() || newModelId.trim(),
       enabled: true,
+      source: 'manual',
     }
 
     setModels((prev) => [...prev, model])
@@ -261,18 +351,26 @@ export function ChannelForm({ channel, onSaved, onCancel }: ChannelFormProps): R
 
       setFetchResult(result)
 
-      if (result.success && result.models.length > 0) {
-        // 合并拉取的模型：保留已有模型的启用状态，新模型默认不勾选
-        const existingIds = new Set(models.map((m) => m.id))
-        const newModels = result.models
-          .filter((m) => !existingIds.has(m.id))
-          .map((m) => ({ ...m, enabled: false }))
-        if (newModels.length > 0) {
-          setModels((prev) => [...prev, ...newModels])
-        }
-      }
+      // 用拉取结果作为权威清单替换：
+      // - source==='manual' 的模型一律保留（即便不在新结果里）
+      // - 在新结果里也存在的旧模型保留 enabled 状态
+      // - 新出现的模型默认未启用
+      // - 既不在新结果里、也不是手动添加的旧模型一律丢弃（清除残留）
+      // 失败（result.success===false）时 result.models 为空，等价于清掉所有非手动模型
+      const fetchedModels = result.success ? result.models : []
+      const fetchedById = new Map(fetchedModels.map((m) => [m.id, m]))
+      setModels((prev) => {
+        const manualKept = prev.filter((m) => m.source === 'manual' && !fetchedById.has(m.id))
+        const merged = fetchedModels.map((m) => {
+          const old = prev.find((p) => p.id === m.id)
+          return old ? { ...m, enabled: old.enabled } : { ...m, enabled: false }
+        })
+        return [...manualKept, ...merged]
+      })
     } catch (error) {
       setFetchResult({ success: false, message: '拉取模型请求失败', models: [] })
+      // IPC 异常等同样按"拉取结果为空"处理：清掉所有非手动模型，保留手动添加的
+      setModels((prev) => prev.filter((m) => m.source === 'manual'))
     } finally {
       setFetchingModels(false)
     }
@@ -299,9 +397,9 @@ export function ChannelForm({ channel, onSaved, onCancel }: ChannelFormProps): R
     }
   }
 
-  /** 创建渠道（仅新建模式） */
-  const handleCreate = async (): Promise<void> => {
-    if (!name.trim() || !apiKey.trim()) return
+  /** 执行创建渠道 */
+  const doCreate = React.useCallback(async (): Promise<Channel | null> => {
+    if (!name.trim() || !apiKey.trim()) return null
 
     setSaving(true)
     try {
@@ -313,14 +411,79 @@ export function ChannelForm({ channel, onSaved, onCancel }: ChannelFormProps): R
         models,
         enabled,
       }
-      await window.electronAPI.createChannel(input)
-      onSaved()
+      const savedChannel = await window.electronAPI.createChannel(input)
+      if (isAgentEligibleChannel(savedChannel)) {
+        await onAgentEligibilityChange?.(savedChannel, true)
+      }
+      toast.success('渠道创建成功')
+      return savedChannel
     } catch (error) {
       console.error('[模型配置表单] 创建失败:', error)
+      toast.error('渠道创建失败，请检查配置后重试')
+      return null
     } finally {
       setSaving(false)
     }
+  }, [name, provider, baseUrl, apiKey, models, enabled, onAgentEligibilityChange])
+
+  /** 创建渠道（仅新建模式） */
+  const handleCreate = async (): Promise<void> => {
+    if (models.length === 0) {
+      toast.warning('尚未配置模型，建议先从供应商获取或手动添加', { id: 'no-models-warn' })
+      return
+    }
+    const savedChannel = await doCreate()
+    if (savedChannel) onSaved(savedChannel)
   }
+
+  /** 检测表单是否有未保存内容 */
+  const isDirty = !isEdit && (name.trim() !== '' || apiKey.trim() !== '' || models.length > 0)
+  const hasNoModels = !isEdit && models.length === 0
+
+  /** 返回按钮：创建模式下有未保存内容时拦截 */
+  const handleBack = (): void => {
+    if (!isEdit && isDirty) {
+      setShowExitDialog(true)
+      return
+    }
+    if (isEdit) {
+      onSaved()
+    } else {
+      onCancel()
+    }
+  }
+
+  /** 放弃编辑 */
+  const handleDiscard = (): void => {
+    setShowExitDialog(false)
+    onCancel()
+  }
+
+  /** 保存并关闭（从弹窗触发） */
+  const handleSaveAndClose = async (): Promise<void> => {
+    const savedChannel = await doCreate()
+    if (savedChannel) {
+      setShowExitDialog(false)
+      onSaved(savedChannel)
+    }
+  }
+
+  // 同步表单 dirty 状态到全局 atom（供 SettingsPanel 拦截侧边栏导航）
+  React.useEffect(() => {
+    setChannelFormDirty(isDirty)
+    return () => { setChannelFormDirty(false) }
+  }, [isDirty, setChannelFormDirty])
+
+  // 拦截窗口关闭（Cmd+W / Alt+F4 / 点击窗口 X）
+  React.useEffect(() => {
+    if (!isDirty) return
+    const handler = (e: BeforeUnloadEvent): void => {
+      e.preventDefault()
+      e.returnValue = ''
+    }
+    window.addEventListener('beforeunload', handler)
+    return () => window.removeEventListener('beforeunload', handler)
+  }, [isDirty])
 
   // ===== 模型分区 =====
   const enabledModels = models.filter((m) => m.enabled)
@@ -341,21 +504,13 @@ export function ChannelForm({ channel, onSaved, onCancel }: ChannelFormProps): R
           variant="ghost"
           size="icon"
           className="h-8 w-8"
-          onClick={() => { isEdit ? onSaved() : onCancel() }}
+          onClick={handleBack}
         >
           <ArrowLeft size={18} />
         </Button>
         <h3 className="text-lg font-medium text-foreground flex-1">
           {isEdit ? '编辑模型配置' : '添加模型配置'}
         </h3>
-        {/* 编辑模式：auto-save 状态 */}
-        {isEdit && autoSaveStatus !== 'idle' && (
-          <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
-            {autoSaveStatus === 'saving' && <Loader2 size={12} className="animate-spin" />}
-            {autoSaveStatus === 'saved' && <Check size={12} className="text-emerald-500" />}
-            <span>{autoSaveStatus === 'saving' ? '保存中...' : '已保存'}</span>
-          </span>
-        )}
         {/* 新建模式：创建按钮 */}
         {!isEdit && (
           <Button
@@ -372,19 +527,19 @@ export function ChannelForm({ channel, onSaved, onCancel }: ChannelFormProps): R
       {/* 基本信息卡片 */}
       <SettingsSection title="基本信息">
         <SettingsCard>
-          <SettingsInput
-            label="配置名称"
-            value={name}
-            onChange={setName}
-            placeholder="例如: My Anthropic"
-            required
-          />
           <SettingsSelect
             label="供应商类型"
             value={provider}
             onValueChange={handleProviderChange}
             options={PROVIDER_SELECT_OPTIONS}
             placeholder="选择供应商"
+          />
+          <SettingsInput
+            label="供应商名称"
+            value={name}
+            onChange={setName}
+            placeholder="例如: My Anthropic"
+            required
           />
           <SettingsInput
             label="Base URL"
@@ -627,6 +782,29 @@ export function ChannelForm({ channel, onSaved, onCancel }: ChannelFormProps): R
           </div>
         </SettingsCard>
       </SettingsSection>
+
+      {/* 退出拦截弹窗 */}
+      <AlertDialog open={showExitDialog} onOpenChange={setShowExitDialog}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>放弃未保存的更改？</AlertDialogTitle>
+            <AlertDialogDescription>
+              {hasNoModels
+                ? '当前尚未配置模型，建议先配置模型再保存。'
+                : '您填写的内容尚未保存，确定要放弃编辑吗？'}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel onClick={handleDiscard}>放弃编辑</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={handleSaveAndClose}
+              disabled={saving || !name.trim() || !apiKey.trim()}
+            >
+              {saving ? <><Loader2 size={14} className="animate-spin" /> 保存中...</> : '保存并关闭'}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   )
 }

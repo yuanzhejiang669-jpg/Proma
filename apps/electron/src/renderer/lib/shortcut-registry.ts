@@ -15,8 +15,22 @@ const isMac =
 
 // ===== 注册表状态 =====
 
+export interface ShortcutRegistrationOptions {
+  /**
+   * 独占模式。若同一快捷键的任一注册项设置了 exclusive=true，
+   * 则仅执行**最后注册的** exclusive handler，其余 handler（无论是否 exclusive）均被跳过。
+   * 用于在嵌套场景中让"最内层"组件捕获快捷键，避免触发外层全局逻辑。
+   */
+  exclusive?: boolean
+}
+
+interface ShortcutHandlerEntry {
+  callback: () => void
+  options: ShortcutRegistrationOptions
+}
+
 /** shortcutId → handler 集合 */
-const handlers = new Map<string, Set<() => void>>()
+const handlers = new Map<string, Set<ShortcutHandlerEntry>>()
 
 /** 当前用户自定义配置 */
 let currentOverrides: ShortcutOverrides = {}
@@ -28,26 +42,69 @@ let initialized = false
 
 interface ParsedAccelerator {
   cmd: boolean
+  ctrl: boolean
   shift: boolean
   alt: boolean
   key: string
 }
 
+function normalizeKeyName(key: string): string {
+  if (key === ' ') return 'space'
+
+  const keyMap: Record<string, string> = {
+    arrowup: 'up',
+    arrowdown: 'down',
+    arrowleft: 'left',
+    arrowright: 'right',
+    escape: 'esc',
+    return: 'enter',
+    '+': 'plus',
+  }
+  const mapped = keyMap[key.toLowerCase()]
+  return (mapped ?? key).toLowerCase()
+}
+
+function isModifierName(part: string): boolean {
+  const key = part.toLowerCase()
+  return [
+    'cmd',
+    'command',
+    'meta',
+    'super',
+    'ctrl',
+    'control',
+    'cmdorctrl',
+    'commandorcontrol',
+    'shift',
+    'alt',
+    'option',
+  ].includes(key)
+}
+
 /**
  * 解析快捷键字符串为结构化对象
  *
- * 支持格式：'Cmd+Shift+M'、'Ctrl+K'、'Cmd+,'
+ * 支持格式：'Cmd+Shift+M'、'Ctrl+K'、'CmdOrCtrl+,'
  */
 function parseAccelerator(accelerator: string): ParsedAccelerator {
   const parts = accelerator.split('+').map((p) => p.trim())
-  const key = (parts[parts.length - 1] ?? '').toLowerCase()
-  const modifiers = parts.slice(0, -1).map((m) => m.toLowerCase())
+  const isModifierOnly = parts.length > 0 && parts.every(isModifierName)
+  const key = isModifierOnly ? '' : normalizeKeyName(parts[parts.length - 1] ?? '')
+  const modifiers = (isModifierOnly ? parts : parts.slice(0, -1)).map((m) => m.toLowerCase())
+  const hasCmdOrCtrl =
+    modifiers.includes('cmdorctrl') || modifiers.includes('commandorcontrol')
 
   return {
     cmd:
       modifiers.includes('cmd') ||
+      modifiers.includes('command') ||
+      modifiers.includes('meta') ||
+      modifiers.includes('super') ||
+      (isMac && hasCmdOrCtrl),
+    ctrl:
       modifiers.includes('ctrl') ||
-      modifiers.includes('cmdorctrl'),
+      modifiers.includes('control') ||
+      (!isMac && hasCmdOrCtrl),
     shift: modifiers.includes('shift'),
     alt: modifiers.includes('alt') || modifiers.includes('option'),
     key,
@@ -61,15 +118,17 @@ function parseAccelerator(accelerator: string): ParsedAccelerator {
  */
 function matchesParsed(e: KeyboardEvent, parsed: ParsedAccelerator): boolean {
   // 修饰键匹配
-  const cmdMatch = isMac ? e.metaKey : e.ctrlKey
-  if (parsed.cmd !== cmdMatch) return false
+  if (parsed.cmd !== e.metaKey) return false
+  if (parsed.ctrl !== e.ctrlKey) return false
   if (parsed.shift !== e.shiftKey) return false
   if (parsed.alt !== e.altKey) return false
-  // macOS 上不应有 Ctrl 被意外按下（除非快捷键要求）
-  if (isMac && !parsed.cmd && e.ctrlKey) return false
 
   // 按键匹配
-  const eventKey = e.key.toLowerCase()
+  if (!parsed.key) {
+    return ['Meta', 'Control', 'Shift', 'Alt'].includes(e.key)
+  }
+
+  const eventKey = normalizeKeyName(e.key)
   return eventKey === parsed.key
 }
 
@@ -85,6 +144,8 @@ function rebuildCache(): void {
     // 全局快捷键由主进程 globalShortcut 处理，不在渲染进程注册
     if (def.global) continue
     const accel = getActiveAccelerator(def.id)
+    // 用户已禁用的快捷键不进入分发缓存
+    if (accel === null) continue
     parsedCache.set(def.id, parseAccelerator(accel))
   }
 }
@@ -106,9 +167,21 @@ function dispatchShortcut(e: KeyboardEvent): void {
       if (handlerSet && handlerSet.size > 0) {
         e.preventDefault()
         e.stopPropagation()
-        // 执行所有注册的 handler
-        for (const handler of handlerSet) {
-          handler()
+        const handlerEntries = Array.from(handlerSet)
+        let exclusiveEntry: ShortcutHandlerEntry | undefined
+        for (let i = handlerEntries.length - 1; i >= 0; i--) {
+          if (handlerEntries[i]!.options.exclusive) {
+            exclusiveEntry = handlerEntries[i]
+            break
+          }
+        }
+        if (exclusiveEntry) {
+          exclusiveEntry.callback()
+        } else {
+          // 执行所有注册的 handler
+          for (const entry of handlerEntries) {
+            entry.callback()
+          }
         }
       }
       return // 匹配一个即停止
@@ -138,16 +211,18 @@ export function initShortcutRegistry(): void {
 export function registerShortcut(
   id: string,
   callback: () => void,
+  options: ShortcutRegistrationOptions = {},
 ): () => void {
   if (!handlers.has(id)) {
     handlers.set(id, new Set())
   }
-  handlers.get(id)!.add(callback)
+  const entry: ShortcutHandlerEntry = { callback, options }
+  handlers.get(id)!.add(entry)
 
   return () => {
     const set = handlers.get(id)
     if (set) {
-      set.delete(callback)
+      set.delete(entry)
       if (set.size === 0) handlers.delete(id)
     }
   }
@@ -166,12 +241,16 @@ export function updateShortcutOverrides(overrides: ShortcutOverrides): void {
 /**
  * 获取某快捷键当前生效的 accelerator 字符串
  *
- * 优先使用用户自定义，否则使用默认值
+ * 返回值含义：
+ * - 非空字符串：当前生效的 accelerator（用户自定义或默认值）
+ * - `null`：用户已禁用此快捷键，不应注册任何监听
+ * - 空字符串：定义不存在或该平台无默认值
  */
-export function getActiveAccelerator(id: string): string {
+export function getActiveAccelerator(id: string): string | null {
   const override = currentOverrides[id]
   if (override) {
     const customAccel = isMac ? override.mac : override.win
+    if (customAccel === null) return null
     if (customAccel) return customAccel
   }
   const def = SHORTCUT_MAP.get(id)
@@ -184,14 +263,21 @@ export function getActiveAccelerator(id: string): string {
  *
  * 将内部格式转换为用户友好的显示：Cmd → ⌘，Shift → ⇧ 等
  */
-export function getAcceleratorDisplay(accelerator: string): string {
+export function getAcceleratorDisplay(accelerator: string | null): string {
   if (!accelerator) return ''
   if (isMac) {
     return accelerator
-      .replace(/Cmd\+/gi, '⌘')
-      .replace(/Shift\+/gi, '⇧')
-      .replace(/Alt\+/gi, '⌥')
-      .replace(/Ctrl\+/gi, '⌃')
+      .split('+')
+      .map((part) => {
+        const normalized = part.trim().toLowerCase()
+        if (['cmd', 'command', 'meta', 'super'].includes(normalized)) return '⌘'
+        if (['ctrl', 'control'].includes(normalized)) return '⌃'
+        if (normalized === 'shift') return '⇧'
+        if (['alt', 'option'].includes(normalized)) return '⌥'
+        if (normalized === 'backspace') return '⌫'
+        return part
+      })
+      .join('')
   }
   return accelerator
 }
@@ -209,9 +295,12 @@ export function checkConflict(
   for (const def of DEFAULT_SHORTCUTS) {
     if (excludeId && def.id === excludeId) continue
     const existingAccel = getActiveAccelerator(def.id)
+    // 已禁用的快捷键不占用任何按键组合，不参与冲突检测
+    if (existingAccel === null || existingAccel === '') continue
     const existingParsed = parseAccelerator(existingAccel)
     if (
       parsed.cmd === existingParsed.cmd &&
+      parsed.ctrl === existingParsed.ctrl &&
       parsed.shift === existingParsed.shift &&
       parsed.alt === existingParsed.alt &&
       parsed.key === existingParsed.key

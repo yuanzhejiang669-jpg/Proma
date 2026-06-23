@@ -1,7 +1,7 @@
 {
   "name": "@proma/core",
-  "version": "0.2.2",
-  "license": "Apache-2.0",
+  "version": "0.2.11",
+  "license": "AGPL-3.0-only",
   "description": "proma core types,storage and core logic with agents",
   "type": "module",
   "main": "./src/index.ts",
@@ -15,10 +15,11 @@
   },
   "dependencies": {
     "@proma/shared": "workspace:*",
+    "highlight.js": "^11.11.1",
     "shiki": "^3.22.0"
   },
   "peerDependencies": {
-    "@anthropic-ai/claude-agent-sdk": ">=0.2.9",
+    "@anthropic-ai/claude-agent-sdk": ">=0.2.123",
     "@anthropic-ai/sdk": ">=0.70.0",
     "@modelcontextprotocol/sdk": ">=1.0.0"
   },

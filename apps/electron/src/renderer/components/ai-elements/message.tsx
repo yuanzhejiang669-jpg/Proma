@@ -22,8 +22,10 @@ import Markdown, { defaultUrlTransform } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import remarkMath from 'remark-math'
 import rehypeKatex from 'rehype-katex'
-import { ChevronDown, ChevronUp, Paperclip, FileText, Sparkles, Server, Download } from 'lucide-react'
+import { ChevronDown, ChevronUp, Paperclip, FileText, Sparkles, Server, Download, MessageSquareText } from 'lucide-react'
 import { cn } from '@/lib/utils'
+import { shouldInspectMermaidCodeBlock, shouldRenderMermaidCodeBlock } from '@/lib/mermaid-detection'
+import { normalizeLatexDelimiters } from '@/lib/normalize-latex'
 import { Button } from '@/components/ui/button'
 import { ImageLightbox } from '@/components/ui/image-lightbox'
 import {
@@ -34,6 +36,7 @@ import {
 } from '@/components/ui/tooltip'
 import { LoadingIndicator } from '@/components/ui/loading-indicator'
 import { CodeBlock, MermaidBlock } from '@proma/ui'
+import { detectLanguage } from '@proma/core'
 import { FilePathChip, isAbsoluteFilePath, isRelativeFilePath } from './file-path-chip'
 import type { HTMLAttributes, ComponentProps, ReactNode } from 'react'
 import type { FileAttachment } from '@proma/shared'
@@ -52,7 +55,7 @@ export function Message({ className, from, ...props }: MessageProps): React.Reac
   return (
     <div
       className={cn(
-        'group flex w-full flex-col gap-0.5 rounded-[10px] px-2.5 py-2.5',
+        'message-item group flex w-full flex-col gap-0.5 rounded-[10px] px-2.5 py-2.5',
         from === 'user' ? 'is-user' : 'is-assistant',
         className
       )}
@@ -97,7 +100,7 @@ export function MessageHeader({
       )}
       <div className="flex flex-col justify-between h-[35px]">
         {model && <span className="text-sm font-semibold text-foreground/60 leading-none">{model}</span>}
-        {time && <span className="text-[10px] text-foreground/[0.38] leading-none">{time}</span>}
+        {time && <span className="message-time text-[10px] text-foreground/[0.38] leading-none">{time}</span>}
       </div>
       {children}
     </div>
@@ -251,25 +254,39 @@ function walkMdastText(
 
 // ----- MentionChip 组件 -----
 
-type MentionType = 'file' | 'skill' | 'mcp'
+type MentionType = 'file' | 'skill' | 'mcp' | 'session'
 
 const MENTION_STYLES: Record<MentionType, { icon: typeof FileText; className: string }> = {
   file: { icon: FileText, className: 'bg-primary/10 text-primary' },
   skill: { icon: Sparkles, className: 'bg-[hsl(270_60%_60%/0.15)] text-[hsl(270_60%_50%)]' },
   mcp: { icon: Server, className: 'bg-[hsl(160_60%_45%/0.15)] text-[hsl(160_60%_35%)]' },
+  session: { icon: MessageSquareText, className: 'bg-[hsl(200_80%_50%/0.14)] text-[hsl(200_80%_40%)]' },
+}
+
+function safeDecode(raw: string): string {
+  try {
+    return decodeURIComponent(raw)
+  } catch {
+    return raw
+  }
 }
 
 function MentionChip({ type, value }: { type: MentionType; value: string }): React.ReactElement {
   const style = MENTION_STYLES[type]
   const Icon = style.icon
-  const display = type === 'file' ? (value.split('/').pop() || value) : value
+  const decoded = safeDecode(value)
+  const display = type === 'file'
+    ? (decoded.split('/').pop() || decoded)
+    : type === 'session'
+      ? `会话 ${decoded.slice(0, 8)}`
+      : decoded
   return (
     <span
       className={cn(
         'inline-flex items-center gap-0.5 rounded px-1 py-[1px] text-[13px] font-medium whitespace-nowrap align-baseline',
         style.className
       )}
-      title={type === 'file' ? value : undefined}
+      title={type === 'file' || type === 'session' ? decoded : undefined}
     >
       <Icon className="size-3 inline shrink-0" />
       {display}
@@ -277,14 +294,14 @@ function MentionChip({ type, value }: { type: MentionType; value: string }): Rea
   )
 }
 
-// ----- remarkMentions：将 @file: /skill: #mcp: 转为 mention:// link 节点 -----
+// ----- remarkMentions：将 @file: /skill: #mcp: &session: 转为 mention:// link 节点 -----
 
 export function remarkMentions() {
   return (tree: MdastParent) => {
     walkMdastText(tree, (node, index, parent) => {
       const text = node.value
       // 每次调用创建独立正则实例，避免 /g 状态在并发 remark pipeline 间互相干扰
-      const mentionPattern = /@file:(\S+)|\/skill:(\S+)|#mcp:(\S+)/g
+      const mentionPattern = /@file:(\S+)|\/skill:(\S+)|#mcp:(\S+)|&session:(\S+)/g
       if (!mentionPattern.test(text)) return
       mentionPattern.lastIndex = 0
 
@@ -296,11 +313,14 @@ export function remarkMentions() {
         if (m.index > lastIdx) {
           parts.push({ type: 'text', value: text.slice(lastIdx, m.index) })
         }
-        const mType: MentionType = m[1] ? 'file' : m[2] ? 'skill' : 'mcp'
-        const mValue = m[1] || m[2] || m[3]
+        const mType: MentionType = m[1] ? 'file' : m[2] ? 'skill' : m[3] ? 'mcp' : 'session'
+        const mValue = m[1] ?? m[2] ?? m[3] ?? m[4] ?? ''
+        // 新版 htmlToMarkdown 已 encodeURIComponent，旧消息是原始路径
+        const alreadyEncoded = /%[0-9A-Fa-f]{2}/.test(mValue)
+        const safeValue = alreadyEncoded ? mValue : encodeURIComponent(mValue)
         parts.push({
           type: 'link',
-          url: `mention://${mType}/${mValue}`,
+          url: `mention://${mType}/${safeValue}`,
           children: [{ type: 'text', value: m[0] }],
         })
         lastIdx = m.index + m[0].length
@@ -377,7 +397,7 @@ function mentionUrlTransform(url: string): string {
 // ===== Memo'd Markdown 子组件（稳定引用，避免 react-markdown 每帧重建组件映射） =====
 
 /** mention:// URL 匹配 */
-const MENTION_URL_RE = /^mention:\/\/(file|skill|mcp)\/(.+)$/
+const MENTION_URL_RE = /^mention:\/\/(file|skill|mcp|session)\/(.+)$/
 
 /** 外部链接 / mention chip 渲染器 */
 const MarkdownLink = React.memo(function MarkdownLink({
@@ -426,16 +446,42 @@ function extractText(node: React.ReactNode): string {
 const MarkdownPre = React.memo(function MarkdownPre({
   children: preChildren,
 }: { children?: React.ReactNode }): React.ReactElement {
+  // react-markdown v10 把 <code> 替换成自定义组件后，type 不再是字符串 'code'，
+  // 但 pre 的 code child 要么是原生 'code'（v9 及之前），要么是自定义函数/对象组件（v10+）。
+  // 通过 type 形态过滤掉意外混入的其他原生 HTML 元素（如 span/div），降低未来 react-markdown
+  // 行为变化导致静默误识别的风险
   const codeChild = React.Children.toArray(preChildren).find(
-    (child): child is React.ReactElement =>
-      React.isValidElement(child) && (child as React.ReactElement).type === 'code'
+    (child): child is React.ReactElement => {
+      if (!React.isValidElement(child)) return false
+      const t = (child as React.ReactElement).type
+      return t === 'code' || typeof t === 'function' || typeof t === 'object'
+    }
   ) as React.ReactElement | undefined
 
   if (codeChild) {
     const codeProps = codeChild.props as { className?: string; children?: React.ReactNode }
-    if (codeProps.className?.includes('language-mermaid')) {
-      const mermaidCode = extractText(codeProps.children).replace(/\n$/, '')
-      return <MermaidBlock code={mermaidCode} />
+    const className = codeProps.className ?? ''
+    const hasExplicitLang = /\blanguage-\S+/.test(className)
+
+    // 先用共享 mermaid 识别（覆盖 language-mermaid/mmd 以及未标语言但内容像 Mermaid 的情况）
+    if (shouldInspectMermaidCodeBlock(className)) {
+      // normalize Windows/legacy-Mac line endings before feeding to Mermaid parser
+      const mermaidCode = extractText(codeProps.children).replace(/\r\n?/g, '\n').replace(/\n$/, '')
+      if (shouldRenderMermaidCodeBlock(className, mermaidCode)) {
+        return <MermaidBlock code={mermaidCode} />
+      }
+    }
+
+    // 未标注语言且非 Mermaid 时：highlight.js 自动检测，命中后注入 language-xxx 喂给 CodeBlock 高亮
+    if (!hasExplicitLang) {
+      const rawCode = extractText(codeProps.children).replace(/\n$/, '')
+      const detected = detectLanguage(rawCode)
+      if (detected !== 'text') {
+        const patchedCode = React.cloneElement(codeChild, {
+          className: `${className} language-${detected}`.trim(),
+        } as Partial<React.HTMLAttributes<HTMLElement>>)
+        return <CodeBlock>{patchedCode}</CodeBlock>
+      }
     }
   }
 
@@ -459,10 +505,7 @@ const MarkdownInlineCode = React.memo(function MarkdownInlineCode({
   const text = typeof codeChildren === 'string' ? codeChildren : ''
 
   if (text) {
-    if (isAbsoluteFilePath(text)) {
-      return <FilePathChip filePath={text.trim()} />
-    }
-    // 相对路径：合并 basePath（主 cwd）+ basePaths（props 或 context 提供的附加目录）作为候选
+    // 合并 basePath（主 cwd）+ basePaths（props 或 context 提供的附加目录）作为候选
     const merged: string[] = []
     if (basePath) merged.push(basePath)
     const allExtra = basePaths || ctxBasePaths
@@ -471,6 +514,9 @@ const MarkdownInlineCode = React.memo(function MarkdownInlineCode({
         if (p && !merged.includes(p)) merged.push(p)
       }
     }
+    if (isAbsoluteFilePath(text)) {
+      return <FilePathChip filePath={text.trim()} basePaths={merged.length > 0 ? merged : undefined} />
+    }
     if (merged.length > 0 && isRelativeFilePath(text)) {
       return <FilePathChip filePath={text.trim()} basePaths={merged} />
     }
@@ -478,7 +524,7 @@ const MarkdownInlineCode = React.memo(function MarkdownInlineCode({
 
   return (
     <code
-      className="rounded bg-foreground/10 px-[0.35em] py-[0.15em] text-[0.875em] font-medium"
+      className="rounded bg-foreground/10 px-[0.35em] py-[0.15em] text-[0.875em] font-mono font-medium"
       {...codeProps}
     >
       {codeChildren}
@@ -507,8 +553,8 @@ export const MessageResponse = React.memo(
     return (
       <div
         className={cn(
-          'prose dark:prose-invert max-w-none text-[15px]',
-          'prose-p:my-1.5 prose-p:leading-[1.6] prose-li:leading-[1.6] prose-pre:my-0 prose-headings:my-2',
+          'prose dark:prose-invert max-w-none text-[length:var(--md-preview-font-size,15px)]',
+          'prose-p:my-1.5 prose-p:leading-[1.6] prose-li:leading-[1.6] prose-pre:my-0 prose-headings:my-2 prose-hr:my-3',
           '[&_.code-block-wrapper+.code-block-wrapper]:mt-4',
           '[&>*:first-child]:mt-0 [&>*:last-child]:mb-0',
           className
@@ -520,7 +566,7 @@ export const MessageResponse = React.memo(
           urlTransform={mentionUrlTransform}
           components={components}
         >
-          {children}
+          {normalizeLatexDelimiters(children.replace(/<!--PROMA_AUTOMATION:[\s\S]*?-->/g, '').trim())}
         </Markdown>
       </div>
     )
@@ -652,11 +698,14 @@ export function MessageStopped({ className, ...props }: MessageStoppedProps): Re
 interface MessageAttachmentsProps extends HTMLAttributes<HTMLDivElement> {
   /** 附件列表 */
   attachments: FileAttachment[]
+  /** 图片编辑完成回调 */
+  onImageEditComplete?: (editedDataUrl: string) => void
 }
 
 /** 消息附件容器 */
 export function MessageAttachments({
   attachments,
+  onImageEditComplete,
   className,
   ...props
 }: MessageAttachmentsProps): React.ReactElement {
@@ -670,7 +719,7 @@ export function MessageAttachments({
       {imageAttachments.length > 0 && (
         <div className="flex flex-wrap gap-2.5">
           {imageAttachments.map((att) => (
-            <MessageAttachmentImage key={att.id} attachment={att} isSingle={isSingleImage} />
+            <MessageAttachmentImage key={att.id} attachment={att} isSingle={isSingleImage} onEditComplete={onImageEditComplete} />
           ))}
         </div>
       )}
@@ -692,10 +741,12 @@ interface MessageAttachmentImageProps {
   attachment: FileAttachment
   /** 是否为唯一附件（单图模式） */
   isSingle?: boolean
+  /** 编辑完成回调 */
+  onEditComplete?: (editedDataUrl: string) => void
 }
 
 /** 图片附件展示（单图: max 500px，多图: 280px 方块），点击可预览大图 */
-function MessageAttachmentImage({ attachment, isSingle = false }: MessageAttachmentImageProps): React.ReactElement {
+function MessageAttachmentImage({ attachment, isSingle = false, onEditComplete }: MessageAttachmentImageProps): React.ReactElement {
   const [imageSrc, setImageSrc] = React.useState<string | null>(null)
   const [lightboxOpen, setLightboxOpen] = React.useState(false)
 
@@ -757,6 +808,7 @@ function MessageAttachmentImage({ attachment, isSingle = false }: MessageAttachm
         open={lightboxOpen}
         onOpenChange={setLightboxOpen}
         onSave={handleSave}
+        onEditComplete={onEditComplete}
       />
     </div>
   )

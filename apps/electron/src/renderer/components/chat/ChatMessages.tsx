@@ -45,8 +45,9 @@ import {
 import { useSmoothStream } from '@proma/ui'
 import { ScrollPositionManager } from '@/hooks/useScrollPositionMemory'
 import { useConversationParallelMode } from '@/hooks/useConversationSettings'
-import { getModelLogo } from '@/lib/model-logo'
+import { getModelLogo, resolveModelProvider } from '@/lib/model-logo'
 import { userProfileAtom } from '@/atoms/user-profile'
+import { channelsAtom } from '@/atoms/chat-atoms'
 import { tabMinimapCacheAtom } from '@/atoms/tab-atoms'
 import type { ChatMessage, ChatToolActivity } from '@proma/shared'
 
@@ -154,6 +155,8 @@ interface ChatMessagesProps {
   onDeleteDivider?: (messageId: string) => void
   /** 加载更多历史消息回调 */
   onLoadMore?: () => Promise<void>
+  /** 图片编辑完成回调 */
+  onImageEditComplete?: (editedDataUrl: string) => void
 }
 
 /** 空状态引导 — 使用 WelcomeEmptyState */
@@ -181,8 +184,10 @@ export function ChatMessages({
   inlineEditingMessageId,
   onDeleteDivider,
   onLoadMore,
+  onImageEditComplete,
 }: ChatMessagesProps): React.ReactElement {
   const userProfile = useAtomValue(userProfileAtom)
+  const channels = useAtomValue(channelsAtom)
   const setMinimapCache = useSetAtom(tabMinimapCacheAtom)
 
   // 平滑流式输出：将高频更新转为逐字渲染
@@ -209,26 +214,52 @@ export function ChatMessages({
   /**
    * 流式完成过渡：streaming 结束到持久化消息加载完成之间，
    * 强制 resize="instant" 避免中间高度变化触发平滑滚动动画。
+   *
+   * render-phase 计算保证第一帧就能切到 instant（不依赖 useEffect 延迟）。
    */
-  const [transitioning, setTransitioning] = React.useState(false)
+  const [transitioningCooldown, setTransitioningCooldown] = React.useState(false)
+  const wasStreamingRef = React.useRef(streaming)
+
+  const needsInstant = !streaming && (!!streamingContent || !!smoothContent)
+
   React.useEffect(() => {
-    if (streaming) {
-      setTransitioning(false)
-      return
+    if (wasStreamingRef.current && !streaming) {
+      setTransitioningCooldown(true)
     }
-    if (streamingContent || smoothContent) {
-      setTransitioning(true)
-      return
-    }
-    const timer = setTimeout(() => setTransitioning(false), 150)
+    wasStreamingRef.current = streaming
+  }, [streaming])
+
+  React.useEffect(() => {
+    if (needsInstant) return
+    const timer = setTimeout(() => setTransitioningCooldown(false), 150)
     return () => clearTimeout(timer)
-  }, [streaming, streamingContent, smoothContent])
+  }, [needsInstant])
+
+  const transitioning = needsInstant || transitioningCooldown
+
+  // 缓存 streaming MessageHeader 的 props，避免每帧 re-render 导致闪烁
+  const streamingTime = React.useMemo(
+    () => formatMessageTime(startedAt ?? Date.now()),
+    [startedAt]
+  )
+  const streamingLogo = React.useMemo(
+    () => (
+      <img
+        src={getModelLogo(streamingModel ?? '', resolveModelProvider(streamingModel ?? '', channels))}
+        alt="AI"
+        className="size-[35px] rounded-[25%] object-cover"
+      />
+    ),
+    [streamingModel, channels]
+  )
 
   /**
    * 淡入控制：切换对话时先隐藏，等 StickToBottom 定位完成后再显示。
    * 避免 "先看到顶部消息再跳到底部" 的闪烁。
    */
   const [ready, setReady] = React.useState(false)
+  // 空对话无需淡入过渡（无消息则无滚动位置问题）
+  const [skipFadeIn, setSkipFadeIn] = React.useState(false)
   const prevConversationIdRef = React.useRef<string | null>(null)
 
   // 对话切换时立即隐藏
@@ -236,6 +267,7 @@ export function ChatMessages({
     if (conversationId !== prevConversationIdRef.current) {
       prevConversationIdRef.current = conversationId
       setReady(false)
+      setSkipFadeIn(false)
     }
   }, [conversationId])
 
@@ -246,8 +278,9 @@ export function ChatMessages({
     // 必须等消息 IPC 加载完成，否则 messages=[] 会被误判为空对话
     if (!messagesLoaded) return
 
-    // 加载完后确实是空对话：直接显示
+    // 加载完后确实是空对话：直接显示（无需过渡动画）
     if (messages.length === 0 && !streaming) {
+      setSkipFadeIn(true)
       setReady(true)
       return
     }
@@ -328,7 +361,7 @@ export function ChatMessages({
   const dividerSet = new Set(contextDividers)
 
   return (
-    <Conversation resize={ready && !transitioning ? 'smooth' : 'instant'} className={ready ? 'opacity-100 transition-opacity duration-200' : 'opacity-0'}>
+    <Conversation resize={ready && !transitioning ? 'smooth' : 'instant'} className={ready ? (skipFadeIn ? 'opacity-100' : 'opacity-100 transition-opacity duration-200') : 'opacity-0'}>
       <ScrollPositionManager id={conversationId} ready={ready} />
       {/* 滚动到顶部时自动加载更多历史 */}
       <ScrollTopLoader
@@ -357,6 +390,7 @@ export function ChatMessages({
                     onSubmitInlineEdit={onSubmitInlineEdit}
                     onCancelInlineEdit={onCancelInlineEdit}
                     isInlineEditing={msg.id === inlineEditingMessageId}
+                    onImageEditComplete={onImageEditComplete}
                   />
                 </div>
                 {/* 分隔线 */}
@@ -374,14 +408,8 @@ export function ChatMessages({
               <Message from="assistant">
                 <MessageHeader
                   model={streamingModel ?? undefined}
-                  time={formatMessageTime(Date.now())}
-                  logo={
-                    <img
-                      src={getModelLogo(streamingModel ?? '')}
-                      alt="AI"
-                      className="size-[35px] rounded-[25%] object-cover"
-                    />
-                  }
+                  time={streamingTime}
+                  logo={streamingLogo}
                 />
                 <MessageContent>
                   {/* 工具活动指示器 */}
@@ -409,6 +437,8 @@ export function ChatMessages({
                     streaming && !smoothReasoning && <MessageLoading startedAt={startedAt} />
                   )}
                 </MessageContent>
+                {/* 操作栏占位：预留与 MessageActions 相同高度，防止流式结束时布局跳动 */}
+                <div className="pl-[46px] mt-0.5 min-h-[28px]" />
               </Message>
             )}
           </>

@@ -18,13 +18,22 @@ import {
 import {
   themeModeAtom,
   themeStyleAtom,
+  interfaceVariantAtom,
   systemIsDarkAtom,
   updateThemeMode,
   updateThemeStyle,
+  updateInterfaceVariant,
   applyThemeToDOM,
+  applyInterfaceVariantToDOM,
 } from '@/atoms/theme'
+import {
+  markdownFontSizeAtom,
+  updateMarkdownFontSize,
+} from '@/atoms/markdown-font-size'
+import { previewModePreferenceAtom, type PreviewModePreference } from '@/atoms/preview-atoms'
 import { cn } from '@/lib/utils'
-import type { ThemeMode, ThemeStyle } from '../../../types'
+import { detectIsWindows } from '@/lib/platform'
+import type { InterfaceVariant, ThemeMode, ThemeStyle, MarkdownFontSize } from '../../../types'
 
 // ===== Logo 资源导入（用于图标选择器） =====
 import promaBlackLogo from '@/assets/bots/proma-logos/proma-black.png'
@@ -41,6 +50,15 @@ import proma8bitLogo from '@/assets/bots/proma-logos/proma-8bit.png'
 import promaCyberpunkLogo from '@/assets/bots/proma-logos/proma-cyberpunk.png'
 import promaFuturisticLogo from '@/assets/bots/proma-logos/proma-futuristic.png'
 
+// ===== 主题预览图片导入 =====
+import themeCloudDancer from '@/assets/theme-previews/theme-cloud-dancer.webp'
+import themeOceanLight from '@/assets/theme-previews/theme-ocean-light.webp'
+import themeForestMorning from '@/assets/theme-previews/theme-forest-morning.webp'
+import themeOceanDark from '@/assets/theme-previews/theme-ocean-dark.webp'
+import themeForestNight from '@/assets/theme-previews/theme-forest-night.webp'
+import themeMorandiNight from '@/assets/theme-previews/theme-morandi-night.webp'
+import themeTerminalDark from '@/assets/theme-previews/theme-terminal-dark.png'
+
 /** 主题选项 */
 const THEME_OPTIONS = [
   { value: 'light', label: '浅色' },
@@ -49,54 +67,90 @@ const THEME_OPTIONS = [
   { value: 'special', label: '特殊风格' },
 ]
 
+/** 界面风格选项 */
+const INTERFACE_VARIANT_OPTIONS: { value: InterfaceVariant; label: string }[] = [
+  { value: 'classic', label: '经典' },
+  { value: 'modern', label: '现代' },
+]
+
+/** Markdown 字号选项 */
+const MARKDOWN_FONT_SIZE_OPTIONS = [
+  { value: 'small', label: '小' },
+  { value: 'medium', label: '中' },
+  { value: 'large', label: '大' },
+]
+
+/** 预览默认展开方式 */
+const PREVIEW_MODE_OPTIONS: { value: PreviewModePreference; label: string }[] = [
+  { value: 'tab', label: '标签页' },
+  { value: 'split', label: '侧边分屏' },
+]
+
+/** 特殊风格 ID（排除 default） */
+type SpecialStyleId = Exclude<ThemeStyle, 'default'>
+
 /** 特殊风格定义 */
 interface SpecialStyle {
-  id: ThemeStyle
+  id: SpecialStyleId
   name: string
   variant: 'light' | 'dark'
-  /** 预览色 */
-  preview: {
-    left: string   // 左侧色块（侧边栏）
-    right: string  // 右侧色块（主背景）
-  }
+  /** 主题预览图 */
+  image: string
+  /** 图片裁剪位置（默认居中） */
+  objectPosition?: string
+  /** 图片缩放比例（默认 1） */
+  imageScale?: number
+  /** Tooltip 提示 */
+  tooltip?: string
 }
 
-const SPECIAL_STYLES: SpecialStyle[] = [
+const SPECIAL_STYLES: readonly SpecialStyle[] = [
   {
     id: 'slate-light',
     name: '云朵舞者',
     variant: 'light',
-    preview: { left: '#e8e6e2', right: '#f0efec' },
+    image: themeCloudDancer,
+    imageScale: 1.3,
   },
   {
     id: 'ocean-light',
     name: '晴空碧海',
     variant: 'light',
-    preview: { left: '#b8d4e5', right: '#d4e5f0' },
+    image: themeOceanLight,
   },
   {
     id: 'forest-light',
     name: '森息晨光',
     variant: 'light',
-    preview: { left: '#e2e9e4', right: '#3f8361' },
+    image: themeForestMorning,
+    imageScale: 1.45,
   },
   {
     id: 'ocean-dark',
-    name: '苍穹暮色',
+    name: '远山暮霭',
     variant: 'dark',
-    preview: { left: '#1a2535', right: '#3a6a9b' },
+    image: themeOceanDark,
   },
   {
     id: 'forest-dark',
     name: '森息夜语',
     variant: 'dark',
-    preview: { left: '#1b2721', right: '#185337' },
+    image: themeForestNight,
   },
   {
     id: 'slate-dark',
     name: '莫兰迪夜',
     variant: 'dark',
-    preview: { left: '#272429', right: '#c9a89e' },
+    image: themeMorandiNight,
+    imageScale: 1.15,
+    objectPosition: '44% 58%',
+  },
+  {
+    id: 'terminal-dark',
+    name: '旧屏微光',
+    variant: 'dark',
+    image: themeTerminalDark,
+    tooltip: '该主题包含轻微闪烁动画',
   },
 ]
 
@@ -134,7 +188,10 @@ const ZOOM_HINT = isMac
 export function AppearanceSettings(): React.ReactElement {
   const [themeMode, setThemeMode] = useAtom(themeModeAtom)
   const [themeStyle, setThemeStyle] = useAtom(themeStyleAtom)
+  const [interfaceVariant, setInterfaceVariant] = useAtom(interfaceVariantAtom)
   const systemIsDark = useAtomValue(systemIsDarkAtom)
+  const [markdownFontSize, setMarkdownFontSize] = useAtom(markdownFontSizeAtom)
+  const [previewModePref, setPreviewModePref] = useAtom(previewModePreferenceAtom)
 
   /** 切换主题模式 */
   const handleThemeChange = React.useCallback((value: string) => {
@@ -159,6 +216,21 @@ export function AppearanceSettings(): React.ReactElement {
     applyThemeToDOM('special', style, systemIsDark)
   }, [setThemeMode, setThemeStyle, systemIsDark])
 
+  /** 切换界面风格 */
+  const handleInterfaceVariantChange = React.useCallback((value: string) => {
+    const variant = value as InterfaceVariant
+    setInterfaceVariant(variant)
+    updateInterfaceVariant(variant)
+    applyInterfaceVariantToDOM(variant)
+  }, [setInterfaceVariant])
+
+  /** 切换 Markdown 字号 */
+  const handleMarkdownFontSizeChange = React.useCallback((value: string) => {
+    const size = value as MarkdownFontSize
+    setMarkdownFontSize(size)
+    updateMarkdownFontSize(size)
+  }, [setMarkdownFontSize])
+
   return (
     <div className="space-y-6">
       <SettingsSection
@@ -175,10 +247,18 @@ export function AppearanceSettings(): React.ReactElement {
             options={THEME_OPTIONS}
           />
 
+          <SettingsSegmentedControl
+            label="界面风格"
+            description="经典风保留旧版视觉；现代风使用更小圆角、更清晰分割线达成更统一干净的质感"
+            value={interfaceVariant}
+            onValueChange={handleInterfaceVariantChange}
+            options={INTERFACE_VARIANT_OPTIONS}
+          />
+
           {/* 特殊风格 - 标签在上，卡片在下 */}
           <div className="px-4 py-3 space-y-2">
             <div className="text-sm font-medium text-foreground">特殊风格</div>
-            <div className="flex justify-between">
+            <div className="grid grid-cols-7 gap-3">
               {SPECIAL_STYLES.map((style) => (
                 <StyleCard
                   key={style.id}
@@ -193,6 +273,22 @@ export function AppearanceSettings(): React.ReactElement {
           <SettingsRow
             label="界面缩放"
             description={ZOOM_HINT}
+          />
+
+          <SettingsSegmentedControl
+            label="Markdown 字号"
+            description="调整 AI 回复与 Markdown 编辑器的正文字号"
+            value={markdownFontSize}
+            onValueChange={handleMarkdownFontSizeChange}
+            options={MARKDOWN_FONT_SIZE_OPTIONS}
+          />
+
+          <SettingsSegmentedControl
+            label="Agent 预览展开方式"
+            description="点击文件、工具结果「预览」按钮时的默认展开位置；拖拽预览 Tab 出标签栏可即时切换为侧边分屏"
+            value={previewModePref}
+            onValueChange={(v) => setPreviewModePref(v as PreviewModePreference)}
+            options={PREVIEW_MODE_OPTIONS}
           />
         </SettingsCard>
       </SettingsSection>
@@ -214,7 +310,7 @@ function AppIconPicker(): React.ReactElement {
     })
   }, [])
 
-  const isWindows = typeof navigator !== 'undefined' && navigator.userAgent.includes('Windows')
+  const isWindows = React.useMemo(() => detectIsWindows(), [])
 
   const handleIconSelect = React.useCallback(async (variantId: string) => {
     if (isWindows) {
@@ -324,7 +420,7 @@ function IconCard({
   )
 }
 
-/** 特殊风格卡片 - 交叠圆圈预览 */
+/** 特殊风格卡片 - 竖长条图片预览 + 名字放在卡片下方 */
 function StyleCard({
   style,
   isSelected,
@@ -338,32 +434,47 @@ function StyleCard({
     <button
       type="button"
       onClick={onSelect}
-      className={cn(
-        'relative flex flex-col items-center gap-2 rounded-lg p-3 transition-all',
-        isSelected && 'shadow-lg shadow-primary/20 bg-card'
-      )}
+      title={style.tooltip}
+      className="group flex flex-col items-center gap-2 focus-visible:outline-none"
     >
-      {/* 交叠圆圈预览 */}
-      <div className="relative w-14 h-10">
-        {/* 左圆 */}
+      {/* 图片卡片本体 */}
+      <div
+        className={cn(
+          'relative rounded-lg overflow-hidden w-[99px] h-[183px] transition-all duration-150',
+          isSelected
+            ? 'ring-2 ring-primary shadow-lg shadow-primary/20'
+            : 'ring-1 ring-border/50 group-hover:ring-border group-focus-visible:ring-2 group-focus-visible:ring-primary group-focus-visible:ring-offset-1'
+        )}
+      >
         <div
-          className="absolute left-0 top-1/2 -translate-y-1/2 size-10 rounded-full"
-          style={{ backgroundColor: style.preview.left }}
-        />
-        {/* 右圆（叠在上面） */}
-        <div
-          className="absolute right-0 top-1/2 -translate-y-1/2 size-10 rounded-full"
-          style={{ backgroundColor: style.preview.right }}
-        />
-      </div>
-      {/* 名称 */}
-      <span className="text-xs font-medium">{style.name}</span>
-      {/* 选中标记 */}
-      {isSelected && (
-        <div className="absolute top-1 right-1 size-4 rounded-full bg-primary flex items-center justify-center">
-          <Check className="size-2.5 text-primary-foreground" />
+          className="w-full h-full"
+          style={style.imageScale ? { transform: `scale(${style.imageScale})` } : undefined}
+        >
+          <img
+            src={style.image}
+            alt={style.name}
+            loading="lazy"
+            decoding="async"
+            className="w-full h-full object-cover"
+            style={style.objectPosition ? { objectPosition: style.objectPosition } : undefined}
+            draggable={false}
+          />
         </div>
-      )}
+        {isSelected && (
+          <div className="absolute top-1 right-1 size-4 rounded-full bg-primary flex items-center justify-center z-10">
+            <Check className="size-2.5 text-primary-foreground" />
+          </div>
+        )}
+      </div>
+      {/* 名字放在卡片下方，吃 token，自动跟主题切色 */}
+      <span
+        className={cn(
+          'text-xs font-medium transition-colors',
+          isSelected ? 'text-foreground' : 'text-muted-foreground group-hover:text-foreground'
+        )}
+      >
+        {style.name}
+      </span>
     </button>
   )
 }

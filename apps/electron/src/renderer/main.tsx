@@ -4,6 +4,11 @@
  * 挂载 React 应用，初始化主题系统。
  */
 
+// 引入 Inter Variable 自托管字体（含 400/500/600/700 等所有字重）
+// index.css 声明了全部语言子集（latin/latin-ext/cyrillic/greek/vietnamese 等），
+// 但每个 @font-face 都带 unicode-range，浏览器仅按需下载实际用到的子集（本应用主要是 latin）。
+import '@fontsource-variable/inter/index.css'
+
 import React, { useEffect, useMemo, useRef } from 'react'
 import ReactDOM from 'react-dom/client'
 import { useSetAtom, useAtomValue, useStore } from 'jotai'
@@ -11,9 +16,11 @@ import App from './App'
 import {
   themeModeAtom,
   themeStyleAtom,
+  interfaceVariantAtom,
   systemIsDarkAtom,
   resolvedThemeAtom,
   applyThemeToDOM,
+  applyInterfaceVariantToDOM,
   initializeTheme,
 } from './atoms/theme'
 import {
@@ -25,14 +32,17 @@ import {
   currentAgentSessionIdAtom,
   workspaceCapabilitiesVersionAtom,
   workspaceFilesVersionAtom,
-  agentDefaultPermissionModeAtom,
   agentThinkingAtom,
   agentEffortAtom,
   agentMaxBudgetUsdAtom,
   agentMaxTurnsAtom,
   agentSettingsReadyAtom,
+  automationGroupOrderAtom,
+  dockBadgeCountAtom,
+  unviewedCompletedSessionIdsAtom,
 } from './atoms/agent-atoms'
 import { updateStatusAtom, initializeUpdater } from './atoms/updater'
+import { automationsAtom } from './atoms/automation-atoms'
 import {
   notificationsEnabledAtom,
   notificationSoundEnabledAtom,
@@ -43,29 +53,36 @@ import {
   stickyUserMessageEnabledAtom,
   initializeUiPreferences,
 } from './atoms/ui-preferences'
+import {
+  markdownFontSizeAtom,
+  initializeMarkdownFontSize,
+} from './atoms/markdown-font-size'
 import { useGlobalAgentListeners } from './hooks/useGlobalAgentListeners'
 import { useGlobalChatListeners } from './hooks/useGlobalChatListeners'
-import { tabsAtom, activeTabIdAtom } from './atoms/tab-atoms'
+import { tabsAtom, activeTabIdAtom, ensureScratchPadTab, getPersistableTabState, scratchPadContentAtom, scratchPadLoadedAtom, SCRATCH_PAD_ID } from './atoms/tab-atoms'
 import type { TabItem } from './atoms/tab-atoms'
 import { chatToolsAtom } from './atoms/chat-tool-atoms'
 import { feishuBotStatesAtom } from './atoms/feishu-atoms'
 import { dingtalkBotStatesAtom } from './atoms/dingtalk-atoms'
 import { currentConversationIdAtom, channelsAtom, channelsLoadedAtom, selectedModelAtom } from './atoms/chat-atoms'
 import { appModeAtom } from './atoms/app-mode'
-import type { FeishuBotBridgeState, FeishuBridgeState, FeishuNotificationSentPayload, DingTalkBotBridgeState, DingTalkBridgeState } from '@proma/shared'
+import type { FeishuBotBridgeState, FeishuBridgeState, DingTalkBotBridgeState, DingTalkBridgeState } from '@proma/shared'
 import { Toaster } from './components/ui/sonner'
 import { toast } from 'sonner'
-import { diffCapabilities, migratePermissionMode } from '@proma/shared'
+import { diffCapabilities } from '@proma/shared'
 import type { WorkspaceCapabilities } from '@proma/shared'
 import { showCapabilityChangeToasts } from './lib/capabilities-toast'
 import { UpdateDialog } from './components/settings/UpdateDialog'
 import { GlobalShortcuts } from './components/shortcuts/GlobalShortcuts'
 import { TabSwitcher } from './components/tabs/TabSwitcher'
+import { htmlToMarkdown, markdownToHtml } from './lib/markdown-rich-text'
 import './styles/globals.css'
 import 'katex/dist/katex.min.css'
 
 // ===== 窗口类型检测 =====
 const isQuickTaskWindow = new URLSearchParams(window.location.search).get('window') === 'quick-task'
+const isVoiceDictationWindow = new URLSearchParams(window.location.search).get('window') === 'voice-dictation'
+const isDetachedPreviewWindow = new URLSearchParams(window.location.search).get('window') === 'detached-preview'
 
 /**
  * 主题初始化组件
@@ -76,9 +93,11 @@ const isQuickTaskWindow = new URLSearchParams(window.location.search).get('windo
 function ThemeInitializer(): null {
   const setThemeMode = useSetAtom(themeModeAtom)
   const setThemeStyle = useSetAtom(themeStyleAtom)
+  const setInterfaceVariant = useSetAtom(interfaceVariantAtom)
   const setSystemIsDark = useSetAtom(systemIsDarkAtom)
   const themeMode = useAtomValue(themeModeAtom)
   const themeStyle = useAtomValue(themeStyleAtom)
+  const interfaceVariant = useAtomValue(interfaceVariantAtom)
   const systemIsDark = useAtomValue(systemIsDarkAtom)
 
   // 初始化：从主进程加载设置 + 订阅系统主题变化
@@ -86,7 +105,7 @@ function ThemeInitializer(): null {
     let isMounted = true
     let cleanup: (() => void) | undefined
 
-    initializeTheme(setThemeMode, setSystemIsDark, setThemeStyle).then((fn) => {
+    initializeTheme(setThemeMode, setSystemIsDark, setThemeStyle, setInterfaceVariant).then((fn) => {
       if (isMounted) {
         cleanup = fn
       } else {
@@ -99,7 +118,7 @@ function ThemeInitializer(): null {
       isMounted = false
       cleanup?.()
     }
-  }, [setThemeMode, setSystemIsDark, setThemeStyle])
+  }, [setThemeMode, setSystemIsDark, setThemeStyle, setInterfaceVariant])
 
   // 响应式应用主题到 DOM
   // 用 useMemo 计算"实际会影响 DOM 的状态签名"作为唯一依赖：
@@ -120,6 +139,10 @@ function ThemeInitializer(): null {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [themeSignature])
 
+  useEffect(() => {
+    applyInterfaceVariantToDOM(interfaceVariant)
+  }, [interfaceVariant])
+
   return null
 }
 
@@ -136,11 +159,11 @@ function AgentSettingsInitializer(): null {
   const setCurrentWorkspaceId = useSetAtom(currentAgentWorkspaceIdAtom)
   const bumpCapabilities = useSetAtom(workspaceCapabilitiesVersionAtom)
   const bumpFiles = useSetAtom(workspaceFilesVersionAtom)
-  const setPermissionMode = useSetAtom(agentDefaultPermissionModeAtom)
   const setThinking = useSetAtom(agentThinkingAtom)
   const setEffort = useSetAtom(agentEffortAtom)
   const setMaxBudget = useSetAtom(agentMaxBudgetUsdAtom)
   const setMaxTurns = useSetAtom(agentMaxTurnsAtom)
+  const setAutomationGroupOrder = useSetAtom(automationGroupOrderAtom)
 
   const setAgentSettingsReady = useSetAtom(agentSettingsReadyAtom)
   const setChannels = useSetAtom(channelsAtom)
@@ -203,10 +226,16 @@ function AgentSettingsInitializer(): null {
         window.electronAPI.updateSettings({ agentChannelIds: migrated }).catch(console.error)
       }
 
-      if (settings.agentPermissionMode) {
-        // 迁移旧权限模式值（auto/smart/supervised → acceptEdits/bypassPermissions/plan）
-        setPermissionMode(migratePermissionMode(settings.agentPermissionMode))
+      // 兜底：agentChannelId 存在但不在 agentChannelIds 白名单中，自动修复不一致
+      if (settings.agentChannelId && channelIds.has(settings.agentChannelId)) {
+        const currentIds = settings.agentChannelIds?.filter((id) => channelIds.has(id)) ?? []
+        if (!currentIds.includes(settings.agentChannelId)) {
+          const fixedIds = [...currentIds, settings.agentChannelId]
+          setAgentChannelIds(fixedIds)
+          window.electronAPI.updateSettings({ agentChannelIds: fixedIds }).catch(console.error)
+        }
       }
+
       if (settings.agentThinking) {
         setThinking(settings.agentThinking)
       }
@@ -218,6 +247,9 @@ function AgentSettingsInitializer(): null {
       }
       if (settings.agentMaxTurns != null) {
         setMaxTurns(settings.agentMaxTurns)
+      }
+      if (typeof settings.agentAutomationGroupOrder === 'number') {
+        setAutomationGroupOrder(settings.agentAutomationGroupOrder)
       }
 
       // 加载工作区列表并恢复上次选中的工作区
@@ -239,7 +271,7 @@ function AgentSettingsInitializer(): null {
       console.error(err)
       setAgentSettingsReady(true) // 即使出错也标记就绪，避免永远阻塞
     })
-  }, [setAgentChannelId, setAgentModelId, setAgentChannelIds, setAgentWorkspaces, setCurrentWorkspaceId, setPermissionMode, setThinking, setEffort, setMaxBudget, setMaxTurns, setChannels, setChannelsLoaded, setAgentSettingsReady])
+  }, [setAgentChannelId, setAgentModelId, setAgentChannelIds, setAgentWorkspaces, setCurrentWorkspaceId, setThinking, setEffort, setMaxBudget, setMaxTurns, setAutomationGroupOrder, setChannels, setChannelsLoaded, setAgentSettingsReady])
 
   // 工作区切换时重置能力缓存，预加载基线
   useEffect(() => {
@@ -311,6 +343,26 @@ function UpdaterInitializer(): null {
 }
 
 /**
+ * 定时任务初始化组件
+ *
+ * 加载全部定时任务，并订阅主进程的变更事件（运行完成/状态变化）刷新列表。
+ */
+function AutomationInitializer(): null {
+  const setAutomations = useSetAtom(automationsAtom)
+
+  useEffect(() => {
+    const load = (): void => {
+      window.electronAPI.listAutomations().then(setAutomations).catch(console.error)
+    }
+    load()
+    const unsub = window.electronAPI.onAutomationChanged(load)
+    return unsub
+  }, [setAutomations])
+
+  return null
+}
+
+/**
  * 通知初始化组件
  *
  * 从主进程加载通知开关设置。
@@ -328,6 +380,47 @@ function NotificationsInitializer(): null {
 }
 
 /**
+ * Dock/Launcher 角标同步组件
+ *
+ * 将需要用户处理或查看的事项数量同步到系统应用图标。
+ */
+function DockBadgeInitializer(): null {
+  const count = useAtomValue(dockBadgeCountAtom)
+  const notificationsEnabled = useAtomValue(notificationsEnabledAtom)
+  const currentSessionId = useAtomValue(currentAgentSessionIdAtom)
+  const setUnviewedCompleted = useSetAtom(unviewedCompletedSessionIdsAtom)
+  const badgeCount = notificationsEnabled ? count : 0
+
+  useEffect(() => {
+    window.electronAPI.setDockBadgeCount(badgeCount).catch((error) => {
+      console.error('[Dock 角标] 同步失败:', error)
+    })
+  }, [badgeCount])
+
+  useEffect(() => {
+    const clearCurrentSessionBadge = (): void => {
+      if (!document.hasFocus() || !currentSessionId) return
+      setUnviewedCompleted((prev) => {
+        if (!prev.has(currentSessionId)) return prev
+        const next = new Set(prev)
+        next.delete(currentSessionId)
+        return next
+      })
+    }
+
+    clearCurrentSessionBadge()
+    window.addEventListener('focus', clearCurrentSessionBadge)
+    document.addEventListener('visibilitychange', clearCurrentSessionBadge)
+    return () => {
+      window.removeEventListener('focus', clearCurrentSessionBadge)
+      document.removeEventListener('visibilitychange', clearCurrentSessionBadge)
+    }
+  }, [currentSessionId, setUnviewedCompleted])
+
+  return null
+}
+
+/**
  * UI 偏好初始化组件
  *
  * 从主进程加载 UI 偏好设置（悬浮置顶条等）。
@@ -338,6 +431,21 @@ function UiPreferencesInitializer(): null {
   useEffect(() => {
     initializeUiPreferences(setStickyUserMessageEnabled)
   }, [setStickyUserMessageEnabled])
+
+  return null
+}
+
+/**
+ * Markdown 字号初始化组件
+ *
+ * 从主进程加载字号档位，写入 :root CSS 变量驱动 Markdown 预览。
+ */
+function MarkdownFontSizeInitializer(): null {
+  const setMarkdownFontSize = useSetAtom(markdownFontSizeAtom)
+
+  useEffect(() => {
+    initializeMarkdownFontSize(setMarkdownFontSize)
+  }, [setMarkdownFontSize])
 
   return null
 }
@@ -432,20 +540,6 @@ function FeishuInitializer(): null {
       }))
     })
 
-    // 订阅通知已发送事件 → Sonner + 桌面通知
-    const cleanupNotif = window.electronAPI.onFeishuNotificationSent((payload: FeishuNotificationSentPayload) => {
-      toast('已发送到飞书', {
-        description: `${payload.sessionTitle}: ${payload.preview.slice(0, 60)}`,
-        duration: 3000,
-      })
-      // 桌面通知
-      if (Notification.permission === 'granted') {
-        new Notification('Proma → 飞书', {
-          body: `${payload.sessionTitle} 的回复已发送到飞书`,
-        })
-      }
-    })
-
     // 定期上报在场状态（5 秒间隔 + 焦点变化时即时上报）
     const reportPresence = (): void => {
       const activeSessionId = store.get(currentAgentSessionIdAtom) ?? store.get(currentConversationIdAtom)
@@ -460,7 +554,6 @@ function FeishuInitializer(): null {
 
     return () => {
       cleanupStatus()
-      cleanupNotif()
       clearInterval(interval)
       window.removeEventListener('focus', reportPresence)
       window.removeEventListener('blur', reportPresence)
@@ -565,7 +658,7 @@ function TabStatePersistenceInitializer(): null {
         ...agentSessions.map((s) => s.id),
       ])
 
-      // 过滤掉已被删除的会话，同时校验数据结构
+      // 过滤 diff 类型 Tab（不持久化），同时过滤掉已被删除的会话
       const validTabs = tabState.tabs.filter(
         (t): t is TabItem =>
           typeof t === 'object' &&
@@ -574,6 +667,7 @@ function TabStatePersistenceInitializer(): null {
           'sessionId' in t &&
           'type' in t &&
           'title' in t &&
+          (t.type === 'chat' || t.type === 'agent') &&
           validSessionIds.has(t.sessionId),
       )
       if (validTabs.length === 0) {
@@ -597,21 +691,22 @@ function TabStatePersistenceInitializer(): null {
         }
       }
 
-      store.set(tabsAtom, validTabs)
+      const activeTab = validTabs.find((t) => t.id === restoredActiveTabId) ?? validTabs[0] ?? null
+      store.set(tabsAtom, ensureScratchPadTab(activeTab ? [activeTab] : []))
       store.set(activeTabIdAtom, restoredActiveTabId)
 
       // 同步 appMode 和 currentSessionId
-      const activeTab = validTabs.find((t) => t.id === restoredActiveTabId)
       if (activeTab) {
-        store.set(appModeAtom, activeTab.type)
         if (activeTab.type === 'chat') {
+          store.set(appModeAtom, 'chat')
           store.set(currentConversationIdAtom, activeTab.sessionId)
         } else {
+          store.set(appModeAtom, 'agent')
           store.set(currentAgentSessionIdAtom, activeTab.sessionId)
         }
       }
 
-      console.log(`[TabRestore] 已恢复 ${validTabs.length} 个标签页`)
+      console.log(`[TabRestore] 已恢复当前会话入口，历史标签 ${validTabs.length} 个已收敛到左侧列表`)
     }).catch((err) => console.error('[TabRestore] 恢复标签页失败:', err))
       .finally(() => { restoredRef.current = true })
   }, [store])
@@ -623,8 +718,9 @@ function TabStatePersistenceInitializer(): null {
     const save = (): void => {
       const tabs = store.get(tabsAtom)
       const activeTabId = store.get(activeTabIdAtom)
+      const persistableTabState = getPersistableTabState(tabs, activeTabId)
       window.electronAPI.updateSettings({
-        tabState: { tabs, activeTabId },
+        tabState: persistableTabState,
       }).catch(console.error)
     }
 
@@ -643,8 +739,9 @@ function TabStatePersistenceInitializer(): null {
       // 使用同步 IPC 确保关闭前数据写入磁盘
       const tabs = store.get(tabsAtom)
       const activeTabId = store.get(activeTabIdAtom)
+      const persistableTabState = getPersistableTabState(tabs, activeTabId)
       if (tabs.length > 0 && window.electronAPI.updateSettingsSync) {
-        const ok = window.electronAPI.updateSettingsSync({ tabState: { tabs, activeTabId } })
+        const ok = window.electronAPI.updateSettingsSync({ tabState: persistableTabState })
         if (!ok) {
           console.warn('[TabPersist] sync IPC failed, falling back to async save')
           save()
@@ -666,6 +763,110 @@ function TabStatePersistenceInitializer(): null {
   return null
 }
 
+/**
+ * Scratch Pad 初始化和持久化组件
+ *
+ * 启动时注入 scratch tab 到 tabsAtom 首位，
+ * 从磁盘加载 scratch-pad.md 内容，自动保存到磁盘。
+ */
+function ScratchPadPersistence(): null {
+  const store = useStore()
+  const loadedRef = useRef(false)
+  const saveTimerRef = useRef<ReturnType<typeof setTimeout>>()
+
+  // 启动：加载文件内容、注入 scratch tab、恢复激活状态
+  useEffect(() => {
+    const init = async (): Promise<void> => {
+      try {
+        // 加载 scratch-pad.md 内容（磁盘存的是 markdown，转为 HTML 给编辑器用）
+        const [settings, loadedMd] = await Promise.all([
+          window.electronAPI.getSettings(),
+          window.electronAPI.loadScratchPad ? window.electronAPI.loadScratchPad() : Promise.resolve(''),
+        ])
+
+        const loadedHtml = loadedMd ? markdownToHtml(loadedMd) : ''
+        store.set(scratchPadContentAtom, loadedHtml)
+        store.set(scratchPadLoadedAtom, true)
+
+        // 将 scratch tab 注入首位
+        const currentTabs = store.get(tabsAtom)
+        const newTabs = ensureScratchPadTab(currentTabs)
+
+        // 如果 tabs 数组变了（新增了 scratch tab），写入 store
+        if (newTabs.length > currentTabs.length || newTabs[0]?.id !== currentTabs[0]?.id) {
+          store.set(tabsAtom, newTabs)
+        }
+
+        // 恢复 scratch 激活状态：如果上次关闭时在 scratch 页，则激活它
+        // 不改变 appMode，保留原有的 chat/agent 侧边栏状态
+        if (settings.scratchPadActive) {
+          store.set(activeTabIdAtom, SCRATCH_PAD_ID)
+        }
+
+        console.log('[ScratchPad] 初始化完成，已加载内容:', !!loadedMd)
+      } catch (err) {
+        console.error('[ScratchPad] 初始化失败:', err)
+      } finally {
+        loadedRef.current = true
+      }
+    }
+
+    init()
+  }, [store])
+
+  // 自动保存：监听 scratchPadContentAtom 变化，防抖写入磁盘
+  useEffect(() => {
+    const save = (): void => {
+      const html = store.get(scratchPadContentAtom)
+      if (window.electronAPI.saveScratchPad) {
+        const md = htmlToMarkdown(html)
+        window.electronAPI.saveScratchPad(md).then((ok) => {
+          if (!ok) console.error('[ScratchPad] 保存失败')
+        }).catch(console.error)
+      }
+    }
+
+    const debouncedSave = (): void => {
+      if (!loadedRef.current) return
+      if (saveTimerRef.current) clearTimeout(saveTimerRef.current)
+      saveTimerRef.current = setTimeout(save, 500)
+    }
+
+    const unsub = store.sub(scratchPadContentAtom, debouncedSave)
+
+    // beforeunload 时同步写入
+    const handleBeforeUnload = (): void => {
+      if (saveTimerRef.current) clearTimeout(saveTimerRef.current)
+      const html = store.get(scratchPadContentAtom)
+      if (window.electronAPI.saveScratchPadSync) {
+        const md = htmlToMarkdown(html)
+        window.electronAPI.saveScratchPadSync(md)
+      }
+    }
+    window.addEventListener('beforeunload', handleBeforeUnload)
+
+    return () => {
+      unsub()
+      if (saveTimerRef.current) clearTimeout(saveTimerRef.current)
+      window.removeEventListener('beforeunload', handleBeforeUnload)
+    }
+  }, [store])
+
+  // 监听 activeTabIdAtom 变化，持久化 scratchPadActive 到 settings
+  useEffect(() => {
+    const unsub = store.sub(activeTabIdAtom, () => {
+      const activeTabId = store.get(activeTabIdAtom)
+      const isScratchActive = activeTabId === SCRATCH_PAD_ID
+      window.electronAPI.updateSettings({
+        scratchPadActive: isScratchActive,
+      }).catch(() => {})
+    })
+    return unsub
+  }, [store])
+
+  return null
+}
+
 // ===== 快速任务窗口：轻量渲染 =====
 if (isQuickTaskWindow) {
   import('./components/quick-task/QuickTaskApp').then(({ QuickTaskApp }) => {
@@ -676,6 +877,27 @@ if (isQuickTaskWindow) {
       </React.StrictMode>
     )
   })
+} else if (isVoiceDictationWindow) {
+  import('./components/voice-dictation/VoiceDictationApp').then(({ VoiceDictationApp }) => {
+    ReactDOM.createRoot(document.getElementById('root')!).render(
+      <React.StrictMode>
+        <ThemeInitializer />
+        <VoiceDictationApp />
+        <Toaster position="top-right" />
+      </React.StrictMode>
+    )
+  })
+} else if (isDetachedPreviewWindow) {
+  import('./components/diff/DetachedPreviewApp').then(({ DetachedPreviewApp }) => {
+    ReactDOM.createRoot(document.getElementById('root')!).render(
+      <React.StrictMode>
+        <ThemeInitializer />
+        <MarkdownFontSizeInitializer />
+        <DetachedPreviewApp />
+        <Toaster position="top-right" />
+      </React.StrictMode>
+    )
+  })
 } else {
   // ===== 主窗口：完整渲染 =====
   ReactDOM.createRoot(document.getElementById('root')!).render(
@@ -683,14 +905,18 @@ if (isQuickTaskWindow) {
       <ThemeInitializer />
       <AgentSettingsInitializer />
       <NotificationsInitializer />
+      <DockBadgeInitializer />
       <UiPreferencesInitializer />
+      <MarkdownFontSizeInitializer />
       <ChatListenersInitializer />
       <AgentListenersInitializer />
       <ChatToolInitializer />
       <UpdaterInitializer />
+      <AutomationInitializer />
       <FeishuInitializer />
       <DingTalkInitializer />
       <TabStatePersistenceInitializer />
+      <ScratchPadPersistence />
       <GlobalShortcuts />
       <TabSwitcher />
       <App />

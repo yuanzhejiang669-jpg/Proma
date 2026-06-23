@@ -3,7 +3,8 @@
  *
  * 分为两个区块：
  * 1. 渠道管理 — 所有渠道列表 + 添加/编辑/删除（渠道同时用于 Chat 和 Agent）
- * 2. Agent 供应商 — 从已启用的 Anthropic 渠道中通过 Switch 开关启用多个 Agent 供应商
+ * 2. Agent 供应商 — 从已启用的 Anthropic 兼容渠道（Anthropic / DeepSeek / Kimi / MiniMax）中
+ *    通过 Switch 开关启用多个 Agent 供应商
  */
 
 import * as React from 'react'
@@ -11,12 +12,22 @@ import { useAtom, useSetAtom } from 'jotai'
 import { Plus, Pencil, Trash2, ExternalLink } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Switch } from '@/components/ui/switch'
-import { PROVIDER_LABELS } from '@proma/shared'
+import { PROVIDER_LABELS, isAgentCompatibleProvider } from '@proma/shared'
 import type { Channel } from '@proma/shared'
 import { getChannelLogo, PromaLogo } from '@/lib/model-logo'
 import { agentChannelIdAtom, agentModelIdAtom, agentChannelIdsAtom } from '@/atoms/agent-atoms'
 import { channelsAtom } from '@/atoms/chat-atoms'
 import { SettingsSection, SettingsCard, SettingsRow } from './primitives'
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog'
 import { ChannelForm } from './ChannelForm'
 
 /** 组件视图模式 */
@@ -31,6 +42,17 @@ export function ChannelSettings(): React.ReactElement {
   const [, setAgentModelId] = useAtom(agentModelIdAtom)
   const [agentChannelIds, setAgentChannelIds] = useAtom(agentChannelIdsAtom)
   const setGlobalChannels = useSetAtom(channelsAtom)
+  const [deleteTarget, setDeleteTarget] = React.useState<Channel | null>(null)
+  const agentChannelIdsRef = React.useRef(agentChannelIds)
+  const agentChannelIdRef = React.useRef(agentChannelId)
+
+  React.useEffect(() => {
+    agentChannelIdsRef.current = agentChannelIds
+  }, [agentChannelIds])
+
+  React.useEffect(() => {
+    agentChannelIdRef.current = agentChannelId
+  }, [agentChannelId])
 
   /** 加载渠道列表 */
   const loadChannels = React.useCallback(async (): Promise<Channel[]> => {
@@ -51,29 +73,69 @@ export function ChannelSettings(): React.ReactElement {
     loadChannels()
   }, [loadChannels])
 
-  /** 删除渠道 */
-  const handleDelete = async (channel: Channel): Promise<void> => {
-    if (!confirm(`确定删除渠道「${channel.name}」？此操作不可恢复。`)) return
+  const syncAgentChannelEligibility = React.useCallback(async (
+    channel: Channel,
+    eligible: boolean,
+  ): Promise<void> => {
+    const currentIds = agentChannelIdsRef.current
 
+    if (eligible) {
+      if (currentIds.includes(channel.id)) return
+      const newIds = [...currentIds, channel.id]
+      agentChannelIdsRef.current = newIds
+      setAgentChannelIds(newIds)
+      await window.electronAPI.updateSettings({ agentChannelIds: newIds }).catch(console.error)
+      return
+    }
+
+    if (!currentIds.includes(channel.id)) return
+    const newIds = currentIds.filter((id) => id !== channel.id)
+    agentChannelIdsRef.current = newIds
+    setAgentChannelIds(newIds)
+
+    const updates: Parameters<typeof window.electronAPI.updateSettings>[0] = {
+      agentChannelIds: newIds,
+    }
+    if (agentChannelIdRef.current === channel.id) {
+      agentChannelIdRef.current = null
+      setAgentChannelId(null)
+      setAgentModelId(null)
+      updates.agentChannelId = undefined
+      updates.agentModelId = undefined
+    }
+
+    await window.electronAPI.updateSettings(updates).catch(console.error)
+  }, [setAgentChannelIds, setAgentChannelId, setAgentModelId])
+
+  /** 删除渠道（通过弹窗确认） */
+  const handleDeleteRequest = (channel: Channel): void => {
+    setDeleteTarget(channel)
+  }
+
+  /** 确认删除 */
+  const handleDeleteConfirm = async (): Promise<void> => {
+    if (!deleteTarget) return
+    const target = deleteTarget
     try {
-      await window.electronAPI.deleteChannel(channel.id)
+      await window.electronAPI.deleteChannel(target.id)
 
       // 从 Agent 渠道列表中移除
-      const newIds = agentChannelIds.filter((id) => id !== channel.id)
+      const newIds = agentChannelIds.filter((id) => id !== target.id)
       setAgentChannelIds(newIds)
 
       // 如果删除的是当前选中的 Agent 渠道，清空选择
-      if (agentChannelId === channel.id) {
+      if (agentChannelId === target.id) {
         setAgentChannelId(null)
         setAgentModelId(null)
       }
 
       await window.electronAPI.updateSettings({
         agentChannelIds: newIds,
-        ...(agentChannelId === channel.id && { agentChannelId: undefined, agentModelId: undefined }),
+        ...(agentChannelId === target.id && { agentChannelId: undefined, agentModelId: undefined }),
       })
 
       await loadChannels()
+      setDeleteTarget(null)
     } catch (error) {
       console.error('[渠道设置] 删除渠道失败:', error)
     }
@@ -82,21 +144,11 @@ export function ChannelSettings(): React.ReactElement {
   /** 切换渠道启用状态 */
   const handleToggle = async (channel: Channel): Promise<void> => {
     try {
-      await window.electronAPI.updateChannel(channel.id, { enabled: !channel.enabled })
-
-      // 如果禁用渠道，同时从 Agent 列表中移除
-      if (channel.enabled) {
-        const newIds = agentChannelIds.filter((id) => id !== channel.id)
-        setAgentChannelIds(newIds)
-        await window.electronAPI.updateSettings({ agentChannelIds: newIds })
-
-        // 如果禁用的是当前选中的 Agent 渠道，清空选择
-        if (agentChannelId === channel.id) {
-          setAgentChannelId(null)
-          setAgentModelId(null)
-          await window.electronAPI.updateSettings({ agentChannelId: undefined, agentModelId: undefined })
-        }
-      }
+      const savedChannel = await window.electronAPI.updateChannel(channel.id, { enabled: !channel.enabled })
+      await syncAgentChannelEligibility(
+        savedChannel,
+        savedChannel.enabled && isAgentCompatibleProvider(savedChannel.provider),
+      )
 
       await loadChannels()
     } catch (error) {
@@ -146,14 +198,15 @@ export function ChannelSettings(): React.ReactElement {
       <ChannelForm
         channel={editingChannel}
         onSaved={handleFormSaved}
+        onAgentEligibilityChange={syncAgentChannelEligibility}
         onCancel={handleFormCancel}
       />
     )
   }
 
-  // Anthropic 渠道（已启用）
-  const anthropicChannels = channels.filter(
-    (c) => c.provider === 'anthropic' && c.enabled
+  // Agent 兼容渠道（已启用）：Anthropic / DeepSeek / Kimi API / Kimi Coding Plan / MiniMax
+  const agentCapableChannels = channels.filter(
+    (c) => isAgentCompatibleProvider(c.provider) && c.enabled
   )
 
   // 列表视图
@@ -191,7 +244,7 @@ export function ChannelSettings(): React.ReactElement {
                   setEditingChannel(channel)
                   setViewMode('edit')
                 }}
-                onDelete={() => handleDelete(channel)}
+                onDelete={() => handleDeleteRequest(channel)}
                 onToggle={() => handleToggle(channel)}
               />
             ))}
@@ -209,15 +262,15 @@ export function ChannelSettings(): React.ReactElement {
         </SettingsCard>
         {loading ? (
           <div className="text-sm text-muted-foreground py-8 text-center">加载中...</div>
-        ) : anthropicChannels.length === 0 ? (
+        ) : agentCapableChannels.length === 0 ? (
           <SettingsCard divided={false}>
             <div className="text-sm text-muted-foreground py-8 text-center">
-              暂无可用的 Anthropic 兼容格式渠道，请先在上方添加 Anthropic 渠道并启用
+              暂无可用的 Anthropic 兼容渠道，请先在上方添加 Anthropic / DeepSeek / Kimi / MiniMax 渠道并启用
             </div>
           </SettingsCard>
         ) : (
           <SettingsCard>
-            {anthropicChannels.map((channel) => (
+            {agentCapableChannels.map((channel) => (
               <AgentProviderRow
                 key={channel.id}
                 channel={channel}
@@ -228,6 +281,22 @@ export function ChannelSettings(): React.ReactElement {
           </SettingsCard>
         )}
       </SettingsSection>
+
+      {/* 删除确认弹窗 */}
+      <AlertDialog open={deleteTarget !== null} onOpenChange={(open) => { if (!open) setDeleteTarget(null) }}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>确定删除渠道？</AlertDialogTitle>
+            <AlertDialogDescription>
+              确定删除渠道「{deleteTarget?.name}」？此操作不可恢复。
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel onClick={() => setDeleteTarget(null)}>取消</AlertDialogCancel>
+            <AlertDialogAction onClick={handleDeleteConfirm}>确认删除</AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   )
 }
@@ -246,7 +315,7 @@ function ChannelRow({ channel, onEdit, onDelete, onToggle }: ChannelRowProps): R
   const description = [
     PROVIDER_LABELS[channel.provider],
     enabledCount > 0 ? `${enabledCount} 个模型已启用` : undefined,
-    channel.provider === 'anthropic' ? '可用于 Agent' : undefined,
+    isAgentCompatibleProvider(channel.provider) ? '可用于 Agent' : undefined,
   ]
     .filter(Boolean)
     .join(' · ')
@@ -254,7 +323,7 @@ function ChannelRow({ channel, onEdit, onDelete, onToggle }: ChannelRowProps): R
   return (
     <SettingsRow
       label={channel.name}
-      icon={<img src={getChannelLogo(channel.baseUrl)} alt="" className="w-8 h-8 rounded" />}
+      icon={<img src={getChannelLogo(channel)} alt="" className="w-8 h-8 rounded" />}
       description={description}
       className="group"
     >
@@ -305,7 +374,7 @@ function AgentProviderRow({ channel, enabled, onToggle }: AgentProviderRowProps)
   return (
     <SettingsRow
       label={channel.name}
-      icon={<img src={getChannelLogo(channel.baseUrl)} alt="" className="w-8 h-8 rounded" />}
+      icon={<img src={getChannelLogo(channel)} alt="" className="w-8 h-8 rounded" />}
       description={description}
     >
       <Switch
@@ -327,7 +396,7 @@ function PromaProviderCard(): React.ReactElement {
     <SettingsRow
       label="Proma"
       icon={<img src={PromaLogo} alt="Proma" className="w-8 h-8 rounded" />}
-      description="Proma 官方供应｜稳定｜靠谱｜丝滑｜简单｜优惠套餐｜可用于 Agent"
+      description="Proma 官方供应｜稳定｜靠谱｜丝滑｜简单｜可用于 Agent"
     >
       <Button size="sm" variant="outline" className="gap-1.5" onClick={handleDownload}>
         <ExternalLink size={13} />

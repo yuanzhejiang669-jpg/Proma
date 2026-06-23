@@ -57,6 +57,15 @@ interface ChatViewProps {
   conversationId: string
 }
 
+function cleanupPendingAttachments(attachments: PendingAttachment[]): void {
+  for (const att of attachments) {
+    if (att.previewUrl?.startsWith('blob:')) {
+      URL.revokeObjectURL(att.previewUrl)
+    }
+    window.__pendingAttachmentData?.delete(att.id)
+  }
+}
+
 export function ChatView({ conversationId }: ChatViewProps): React.ReactElement {
   return (
     <ConversationProvider conversationId={conversationId}>
@@ -70,6 +79,7 @@ function ChatViewInner({ conversationId }: ChatViewProps): React.ReactElement {
   const [messages, setMessages] = React.useState<ChatMessage[]>([])
   const [contextDividers, setContextDividers] = React.useState<string[]>([])
   const [pendingAttachments, setPendingAttachments] = React.useState<PendingAttachment[]>([])
+  const pendingAttachmentsRef = React.useRef<PendingAttachment[]>([])
   const [hasMoreMessages, setHasMoreMessages] = React.useState(false)
   const [messagesLoaded, setMessagesLoaded] = React.useState(false)
   const [inlineEditingMessageId, setInlineEditingMessageId] = React.useState<string | null>(null)
@@ -82,6 +92,7 @@ function ChatViewInner({ conversationId }: ChatViewProps): React.ReactElement {
 
   // ===== 全局 atoms（Map 结构，按 conversationId 读取） =====
   const conversations = useAtomValue(conversationsAtom)
+  const setConversations = useSetAtom(conversationsAtom)
   const setDraftSessionIds = useSetAtom(draftSessionIdsAtom)
   const streamingStates = useAtomValue(streamingStatesAtom)
   const setStreamingStates = useSetAtom(streamingStatesAtom)
@@ -99,6 +110,17 @@ function ChatViewInner({ conversationId }: ChatViewProps): React.ReactElement {
   // 从全局 atom 读取快速任务待发送消息
   const globalChatPending = useAtomValue(chatPendingMessageAtom)
   const setGlobalChatPending = useSetAtom(chatPendingMessageAtom)
+
+  React.useEffect(() => {
+    pendingAttachmentsRef.current = pendingAttachments
+  }, [pendingAttachments])
+
+  React.useEffect(() => {
+    return () => {
+      cleanupPendingAttachments(pendingAttachmentsRef.current)
+      pendingAttachmentsRef.current = []
+    }
+  }, [])
 
   // 检测到当前对话的待发送消息时，捕获到本地状态
   React.useEffect(() => {
@@ -126,19 +148,10 @@ function ChatViewInner({ conversationId }: ChatViewProps): React.ReactElement {
 
     // 清空附件列表和缓存
     setPendingAttachments((prev) => {
-      // 释放 blob URLs
-      prev.forEach((att) => {
-        if (att.previewUrl?.startsWith('blob:')) {
-          URL.revokeObjectURL(att.previewUrl)
-        }
-      })
+      cleanupPendingAttachments(prev)
+      pendingAttachmentsRef.current = []
       return []
     })
-
-    // 清空附件数据缓存（如果存在）
-    if (window.__pendingAttachmentData) {
-      window.__pendingAttachmentData.clear()
-    }
   }, [conversationId, setPendingRecommendation])
 
   // ===== 加载消息 + 上下文分隔线 =====
@@ -272,12 +285,8 @@ function ChatViewInner({ conversationId }: ChatViewProps): React.ReactElement {
       }
 
       // 清理 pending 附件和临时缓存
-      for (const att of currentAttachments) {
-        if (att.previewUrl?.startsWith('blob:')) {
-          URL.revokeObjectURL(att.previewUrl)
-        }
-        window.__pendingAttachmentData?.delete(att.id)
-      }
+      cleanupPendingAttachments(currentAttachments)
+      pendingAttachmentsRef.current = []
       setPendingAttachments([])
     }
 
@@ -293,6 +302,19 @@ function ChatViewInner({ conversationId }: ChatViewProps): React.ReactElement {
         startedAt: Date.now(),
       })
       return map
+    })
+
+    // 乐观更新：发送瞬间若会话已归档，立即取消归档，
+    // 让侧边栏立即把它移到未归档列表，无需等待 STREAM_COMPLETE。
+    // 后端 appendMessage 已会做同样的取消归档，STREAM_COMPLETE 时会再用 listConversations 对齐
+    setConversations((prev) => {
+      const idx = prev.findIndex((c) => c.id === conversationId)
+      if (idx === -1) return prev
+      const conv = prev[idx]!
+      if (!conv.archived) return prev
+      const next = [...prev]
+      next[idx] = { ...conv, archived: false, updatedAt: Date.now() }
+      return next
     })
 
     const input: ChatSendInput = {
@@ -344,6 +366,7 @@ function ChatViewInner({ conversationId }: ChatViewProps): React.ReactElement {
     activeToolIds,
     setChatStreamErrors,
     setStreamingStates,
+    setConversations,
   ])
 
   // ===== 自动发送快速任务消息 =====
@@ -419,7 +442,7 @@ function ChatViewInner({ conversationId }: ChatViewProps): React.ReactElement {
     window.electronAPI.stopGeneration(conversationId).catch(console.error)
   }, [conversationId, setStreamingStates])
 
-  // 监听快捷键系统分发的 stop-generation 事件（Cmd+.）
+  // 监听快捷键系统分发的 stop-generation 事件
   React.useEffect(() => {
     const handler = (): void => {
       if (isStreaming) handleStop()
@@ -554,6 +577,28 @@ function ChatViewInner({ conversationId }: ChatViewProps): React.ReactElement {
     setHasMoreMessages(false)
   }, [conversationId])
 
+  /** 消息历史中的图片编辑完成 → 作为新附件加入输入框 */
+  const handleImageEditComplete = React.useCallback((editedDataUrl: string): void => {
+    const base64 = editedDataUrl.split(',')[1]
+    if (!base64) return
+
+    const id = `pending-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    const pending: PendingAttachment = {
+      id,
+      filename: `edited_image_${Date.now()}.png`,
+      mediaType: 'image/png',
+      localPath: '',
+      size: Math.round(base64.length * 0.75),
+      previewUrl: editedDataUrl,
+    }
+
+    if (!window.__pendingAttachmentData) {
+      window.__pendingAttachmentData = new Map()
+    }
+    window.__pendingAttachmentData.set(id, base64)
+    setPendingAttachments((prev) => [...prev, pending])
+  }, [setPendingAttachments])
+
   return (
     <div className="flex h-full overflow-hidden">
       {/* 主内容区域 */}
@@ -582,6 +627,7 @@ function ChatViewInner({ conversationId }: ChatViewProps): React.ReactElement {
             inlineEditingMessageId={inlineEditingMessageId}
             onDeleteDivider={handleDeleteDivider}
             onLoadMore={handleLoadMore}
+            onImageEditComplete={handleImageEditComplete}
           />
 
           {/* 错误提示 */}
